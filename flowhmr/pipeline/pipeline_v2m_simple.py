@@ -11,6 +11,7 @@ from ..core.math.geometry import rot6d_to_rotation_matrix
 from ..core.framework.loaders import load_object
 from ..core.motion.postprocess import end_vel_to_static_conf
 from ..evaluation.metrics import compute_global_metrics
+from ..model_files import JOINT_REGRESSOR, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,8 @@ class SimpleV2MPipeline(torch.nn.Module):
         test_cfg: dict,
         train_frames: int,
         mean_std: str = "assets/motion_stats.json",
-        smpl_model_path: str = "assets/body_models/smplh/neutral/model.npz",
-        j_regressor_path: str = "assets/body_models/smpl_neutral_J_regressor.pt",
+        smpl_model_path: str | None = None,
+        j_regressor_path: str | None = None,
         pred_type: str = "velocity",
         **kwargs,
     ):
@@ -70,7 +71,7 @@ class SimpleV2MPipeline(torch.nn.Module):
 
         self.register_buffer(
             "J_regressor",
-            torch.load(j_regressor_path, map_location="cpu"),
+            torch.load(j_regressor_path or resolve_model(JOINT_REGRESSOR), map_location="cpu"),
         )
 
         self._parse_train_cfg()

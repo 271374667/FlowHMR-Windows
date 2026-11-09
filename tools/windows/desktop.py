@@ -1,0 +1,237 @@
+"""Native FlowHMR window using the local WebView2 runtime."""
+
+import argparse
+import ctypes
+from ctypes import wintypes
+from html import escape
+import json
+import logging
+import os
+from pathlib import Path
+import socket
+import subprocess
+import threading
+from urllib.parse import urlsplit
+from urllib.request import urlopen
+
+import webview
+
+
+ROOT = Path(__file__).resolve().parents[2]
+TITLE = "FlowHMR"
+FBX_INSTALL_LOCK = threading.Lock()
+
+
+def status_page(heading, detail):
+    return f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<style>
+body {{margin:0;display:grid;place-items:center;min-height:100vh;background:#252525;color:#ededed;
+       font:14px 'Segoe UI','Microsoft YaHei',sans-serif}}
+main {{width:min(480px,85%);padding:24px;background:#303030;border:1px solid #454545;border-radius:5px}}
+h1 {{font-size:18px;margin:0 0 12px}} p {{margin:0;color:#bbb;line-height:1.6}}
+</style><main><h1>{escape(heading)}</h1><p>{escape(detail)}</p></main></html>"""
+
+
+def _hide_download_flyout(_sender, args):
+    # pywebview still chooses the destination. Handled only hides WebView2's UI.
+    args.Handled = True
+
+
+def _on_webview2_ready(sender, args):
+    if args.IsSuccess:
+        sender.CoreWebView2.DownloadStarting += _hide_download_flyout
+
+
+def configure_downloads(window):
+    # before_show runs on the window's UI thread, before navigating to FlowHMR.
+    control = getattr(window.native, "webview", None)
+    if not hasattr(control, "CoreWebView2"):
+        return
+    core = control.CoreWebView2
+    if core is None:
+        control.CoreWebView2InitializationCompleted += _on_webview2_ready
+    else:
+        core.DownloadStarting += _hide_download_flyout
+
+
+def open_models_folder():
+    directory = ROOT / "models"
+    directory.mkdir(exist_ok=True)
+    os.startfile(directory)
+
+
+def open_runtime_folder():
+    directory = ROOT / "runtime/environments"
+    directory.mkdir(parents=True, exist_ok=True)
+    os.startfile(directory)
+
+
+def prepare_fbx():
+    runtime = ROOT / "runtime"
+    python = runtime / "python.exe"
+    if not python.is_file() or (runtime / "Lib/site-packages/fbx.pyd").is_file():
+        return
+    with FBX_INSTALL_LOCK:
+        try:
+            with (ROOT / "logs/fbx-install.log").open("ab") as log:
+                subprocess.run([str(python), "-I", "-B", str(ROOT / "tools/windows/install_fbx.py")],
+                               cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=25, check=True)
+        except (OSError, subprocess.SubprocessError):
+            logging.warning("Optional FBX setup failed; running FlowHMR without FBX export", exc_info=True)
+
+
+def connect(window, port):
+    script = ROOT / "tools/windows/start-web.ps1"
+    launcher_log = ROOT / "logs/desktop-launcher.log"
+    try:
+        logging.info("Connecting to local FlowHMR at port %d", port)
+        # A newly launched server can inherit PowerShell's handles. A pipe would keep
+        # communicate() waiting for EOF even after the launcher reported ready.
+        with launcher_log.open("ab") as log:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                 "-ServerOnly", "-Port", str(port)],
+                cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW, timeout=310,
+            )
+        if result.returncode:
+            raise RuntimeError(f"后端启动失败（{result.returncode}），详情见 logs/desktop-launcher.log。")
+        window.load_url(f"http://127.0.0.1:{port}/")
+        threading.Thread(target=prepare_fbx, name="flowhmr-fbx-setup", daemon=True).start()
+        logging.info("Loaded local FlowHMR at port %d", port)
+    except Exception as error:
+        logging.exception("Failed to connect to FlowHMR")
+        window.load_html(status_page("FlowHMR 启动失败", f"{error} 请查看 logs/desktop.log。"))
+
+
+def expose_runtime_restart(window, port):
+    restart_lock = threading.Lock()
+    url = f"http://127.0.0.1:{port}"
+
+    def reload_backend():
+        try:
+            window.load_html(status_page("正在切换运行环境", "推理服务重启后会自动回到 FlowHMR。"))
+            with (ROOT / "logs/desktop-launcher.log").open("ab") as log:
+                subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                str(ROOT / "tools/windows/stop-web.ps1")], cwd=ROOT, stdout=log,
+                               stderr=subprocess.STDOUT, timeout=25, check=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            connect(window, port)
+        except (OSError, subprocess.SubprocessError):
+            logging.exception("Could not restart FlowHMR for runtime switch")
+            window.load_url(url + "/")
+        finally:
+            restart_lock.release()
+
+    def restart_runtime():
+        current = urlsplit(window.get_current_url() or "")
+        if f"{current.scheme}://{current.netloc}" != url:
+            return False
+        try:
+            with urlopen(url + "/api/runtime", timeout=5) as response:
+                pending = json.load(response).get("pending_restart", False)
+        except (OSError, ValueError):
+            return False
+        if not pending or not restart_lock.acquire(blocking=False):
+            return False
+        threading.Thread(target=reload_backend, name="flowhmr-runtime-restart", daemon=True).start()
+        return True
+
+    window.expose(restart_runtime)
+
+
+def desktop_port(requested):
+    # Keep the same origin for saved UI settings, but allow the portable package
+    # to run beside a source checkout using the usual port.
+    if requested != 60550 or not (ROOT / "runtime/python.exe").is_file():
+        return requested
+    marker = ROOT / ".cache/desktop-port.txt"
+    try:
+        previous = int(marker.read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        previous = requested
+    for port in dict.fromkeys((previous, requested, 0)):
+        if not 0 <= port <= 65535:
+            continue
+        try:
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", port))
+                port = listener.getsockname()[1]
+        except OSError:
+            try:
+                with urlopen(f"http://127.0.0.1:{port}/api/info", timeout=.8) as response:
+                    directory = json.load(response)["model_files"]["directory"]
+                if Path(directory).resolve() != (ROOT / "models").resolve():
+                    continue
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        marker.parent.mkdir(exist_ok=True)
+        marker.write_text(str(port), encoding="ascii")
+        return port
+    return requested
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, required=True)
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+    port = desktop_port(args.port)
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetConsoleWindow.restype = wintypes.HWND
+    inherited_console = bool(kernel.GetConsoleWindow())
+    if inherited_console:
+        kernel.FreeConsole()
+    kernel.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    instance = kernel.CreateMutexW(None, False, f"Local\\FlowHMR-desktop-{port}")
+    if not instance:
+        raise ctypes.WinError(ctypes.get_last_error())
+    already_open = ctypes.get_last_error() == 183
+    try:
+        if already_open:
+            user32 = ctypes.windll.user32
+            user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+            user32.FindWindowW.restype = wintypes.HWND
+            user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+            user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+            handle = user32.FindWindowW(None, TITLE)
+            if handle:
+                user32.ShowWindow(handle, 9)
+                user32.SetForegroundWindow(handle)
+            return
+
+        log_dir = ROOT / "logs"
+        log_dir.mkdir(exist_ok=True)
+        logging.basicConfig(filename=log_dir / "desktop.log", encoding="utf-8", level=logging.INFO,
+                            format="%(asctime)s %(message)s")
+        logging.info("Desktop startup: inherited console=%s", inherited_console)
+        webview.settings["ALLOW_DOWNLOADS"] = True
+        webview.settings["ALLOW_FILE_URLS"] = False
+        webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
+        webview.settings["SHOW_DEFAULT_MENUS"] = False
+        fixed_webview = ROOT / "runtime/webview2"
+        if (fixed_webview / "msedgewebview2.exe").is_file():
+            webview.settings["WEBVIEW2_RUNTIME_PATH"] = os.fspath(fixed_webview)
+        window = webview.create_window(
+            TITLE, html=status_page("正在启动 FlowHMR", "正在打开界面。推理模型将在首次生成时加载。"),
+            width=1440, height=900, min_size=(960, 640), background_color="#252525", text_select=True,
+        )
+        window.expose(open_models_folder)
+        window.expose(open_runtime_folder)
+        expose_runtime_restart(window, port)
+        window.events.before_show += configure_downloads
+        window.events.shown += lambda: threading.Thread(target=connect, args=(window, port), daemon=True).start()
+        webview.start(gui="edgechromium", private_mode=False,
+                      storage_path=os.fspath(ROOT / ".cache/webview2"),
+                      icon=os.fspath(ROOT / "assets/flowhmr.ico"))
+    finally:
+        kernel.CloseHandle(instance)
+
+
+if __name__ == "__main__":
+    main()

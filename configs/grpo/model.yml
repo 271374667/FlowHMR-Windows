@@ -5,7 +5,7 @@ max_frame: 360
 motion_fps: 30
 trainer: flowhmr/trainer/v2m_trainer_grpo.V2MGRPOTrainer
 torch_compile: false
-load_from_checkpoint: checkpoints/flowhmr_base/flowhmr_base.ckpt  # base SFT checkpoint
+load_from_checkpoint: models/flowhmr_base/flowhmr_base.ckpt  # base SFT checkpoint
 train_pipeline: flowhmr/pipeline/pipeline_v2m.V2MPipeline
 train_pipeline_args:
   motion_style: basic

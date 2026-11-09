@@ -5,15 +5,16 @@ Converts SMPL-H motion to FBX by constructing the mesh and skeleton from scratch
 
 import logging
 import os
+from pathlib import Path
 from typing import Optional, Tuple
 
 import fbx
 import numpy as np
 import torch
 
-from ..math.geometry import angle_axis_to_rotation_matrix, rot6d_to_rotation_matrix
+from ..math.geometry import angle_axis_to_rotation_matrix
+from ...model_files import SMPLH_FILES, resolve_model
 from .fbx_utils import (
-    SMPLH_JOINT2NUM,
     animate_rotation_from_rotmats,
     animate_translation,
     apply_skinning,
@@ -21,12 +22,57 @@ from .fbx_utils import (
     build_skeleton_nodes,
     create_manager,
     export_scene_atomic,
-    strip_mesh_geometry,
+    store_bind_pose,
 )
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OBJ_TEMPLATE_PATH = "assets/body_models/smplh/textures/male_smplh.obj"
+ASSETS = Path(__file__).resolve().parents[3] / "assets/body_models/smplh"
+DEFAULT_OBJ_TEMPLATE_PATH = ASSETS / "textures/male_smplh.obj"
+
+# The source rig vocabulary understood by FlowHMR 2 MMR and RGB MoCap.
+# Order follows SMPL-H, including the order of its finger joints and weights.
+FBX_JOINT_NAMES = (
+    "Hips", "LeftUpLeg", "RightUpLeg", "Spine", "LeftLeg", "RightLeg", "Spine1",
+    "LeftFoot", "RightFoot", "Spine2", "LeftToeBase", "RightToeBase", "Neck",
+    "LeftShoulder", "RightShoulder", "Head", "LeftArm", "RightArm", "LeftForeArm",
+    "RightForeArm", "LeftHand", "RightHand",
+    *(f"{side}Hand{finger}{joint}" for side in ("Left", "Right")
+      for finger in ("Index", "Middle", "Pinky", "Ring", "Thumb") for joint in (1, 2, 3)),
+)
+HEAD_JOINT = FBX_JOINT_NAMES.index("Head")
+
+
+def _display_frames(joints, parents, *, head_top_y):
+    """A right-handed frame with +Y along each bone's reference direction."""
+    main_child = {0: 3, 9: 12, 20: 25, 21: 40}
+    frames, tips = [], {}
+    for joint, parent in enumerate(parents):
+        children = np.flatnonzero(parents == joint)
+        if len(children):
+            direction = joints[main_child.get(joint, children[0])] - joints[joint]
+        elif joint == HEAD_JOINT:
+            # SMPL-H's Neck -> Head offset points toward the face. It is
+            # the neck axis, not the skull's up axis used by retargeters.
+            direction = np.array([0., head_top_y - joints[joint, 1], 0.])
+            if direction[1] <= 0.:
+                raise ValueError("Invalid SMPL-H head height for FBX export")
+        else:
+            direction = joints[joint] - joints[parent]
+            if joint in (10, 11):  # Toe tips follow the floor.
+                direction[1] = 0.
+                direction *= .65
+        length = float(np.linalg.norm(direction))
+        if length < 1e-6:
+            raise ValueError(f"Degenerate rest bone: {FBX_JOINT_NAMES[joint]}")
+        if not len(children):
+            tips[joint] = length
+        y = direction / length
+        guide = (0., 0., 1.) if abs(y[2]) < .95 else (0., 1., 0.)
+        x = np.cross(y, guide)
+        x /= np.linalg.norm(x)
+        frames.append(np.stack((x, y, np.cross(x, y)), axis=1))
+    return np.asarray(frames), tips
 
 
 def blend_shapes(betas: torch.Tensor, shape_disps: torch.Tensor) -> torch.Tensor:
@@ -77,13 +123,13 @@ def get_offsets_from_beta(
     beta: torch.Tensor, smplx_params: dict, return_template_mesh: bool = True
 ) -> tuple[np.ndarray, torch.Tensor] | np.ndarray:
     v_template = torch.FloatTensor(smplx_params["v_template"]).unsqueeze(0)
-    shape_dirs = torch.FloatTensor(smplx_params["shapedirs"])
+    shape_dirs = torch.FloatTensor(smplx_params["shapedirs"][..., :beta.shape[-1]])
     J_regressor = torch.FloatTensor(smplx_params["J_regressor"])
 
     v_shaped = v_template + blend_shapes(beta, shape_dirs)
     J = vertices2joints(J_regressor, v_shaped).squeeze(0).numpy()
 
-    parents = smplx_params["kintree_table"][0].copy()
+    parents = np.asarray(smplx_params["kintree_table"][0], dtype=np.int64).copy()
     parents[0] = -1
     Translates = J.copy()
     Translates[1:] -= J[parents[1:]]
@@ -119,13 +165,13 @@ def _parse_obj_uv(obj_path: str) -> Tuple[np.ndarray, np.ndarray]:
 class SMPLH2FBX:
     def __init__(
         self,
-        smplh_model_path: str = "./assets/body_models/smplh/neutral/model.npz",
+        smplh_model_path: str | Path | None = None,
         obj_template_path: Optional[str] = DEFAULT_OBJ_TEMPLATE_PATH,
     ):
-        self.smpl_data = dict(np.load(smplh_model_path, allow_pickle=True))
+        with np.load(smplh_model_path or resolve_model(SMPLH_FILES["neutral"]), allow_pickle=True) as model:
+            self.smpl_data = {k: model[k] for k in ("v_template", "J_regressor", "shapedirs", "weights", "kintree_table")}
+            self.smpl_data["faces"] = model["f" if "f" in model else "faces"]
         self.mgr = create_manager()
-        # Pre-sort joint mapping
-        self.joint_names_ordered = [k for k, v in sorted(SMPLH_JOINT2NUM.items(), key=lambda x: x[1])]
 
         # Load UV coordinates from OBJ template
         self.uv_coords: Optional[np.ndarray] = None
@@ -136,79 +182,141 @@ class SMPLH2FBX:
                 "Loaded UV from OBJ: %d uv_coords, %d uv_faces",
                 len(self.uv_coords), len(self.uv_faces),
             )
-        elif obj_template_path:
-            logger.warning("OBJ template not found, UV disabled: %s", obj_template_path)
 
-    def convert_npz_to_fbx(self, npz_data, outname: str, fps: int = 30, export_mesh: bool = True) -> bool:
-        if isinstance(npz_data, str):
-            npz_data = np.load(npz_data, allow_pickle=True)
+    def __enter__(self):
+        return self
 
-        # Use mocap_framerate from NPZ if available
-        if "mocap_framerate" in npz_data:
-            fps = int(npz_data["mocap_framerate"])
+    def __exit__(self, *_):
+        self.mgr.Destroy()
 
-        # Prepare Data & Skeleton Structure
-        scale = 100.0
-        betas_np = np.array(npz_data["betas"])
-        # normalize betas to shape (1, 16) to match SMPL-H model shapedirs
-        if betas_np.ndim == 1:
-            betas_np = betas_np[None, :]
-        elif betas_np.ndim >= 2 and betas_np.shape[0] > 1:
-            betas_np = betas_np[:1]
-        betas = torch.from_numpy(betas_np).float()
-        # Calculate customized skeleton based on Betas
-        # (Simplified: assuming single beta for the whole sequence)
-        rest_pose_trans, v_shaped = get_offsets_from_beta(betas[0:1], self.smpl_data)
+    def convert_npz_to_fbx(self, npz_data, outname: str, fps: int = 30, export_mesh: bool = True,
+                           variant_path=None) -> bool:
+        if isinstance(npz_data, (str, os.PathLike)):
+            with np.load(npz_data, allow_pickle=False) as data:
+                npz_data = {k: data[k] for k in ("poses", "trans", "betas", "mocap_framerate") if k in data}
 
-        poses = torch.from_numpy(npz_data["poses"]).float()
-        rot_mats = angle_axis_to_rotation_matrix(poses.reshape(len(poses), -1, 3)).numpy()
-        trans = npz_data["trans"] * scale
+        fps = int(npz_data.get("mocap_framerate", fps))
+        end = np.asarray(npz_data["poses"]).size // (52 * 3) - 1
+        return self._write_motions([(None, 0, npz_data)], outname, fps, end, export_mesh, variant_path)
 
-        # Build Scene
-        scene = fbx.FbxScene.Create(self.mgr, "")
-        time_mode = fbx.FbxTime().ConvertFrameRateToTimeMode(fps)
-        scene.GetGlobalSettings().SetTimeMode(time_mode)
+    def convert_scene_to_fbx(self, npz_path, people, outname, *, export_mesh=True, variant_path=None) -> bool:
+        """Build one FBX scene, leaving each rig's keys on its source video frames."""
+        with np.load(npz_path, allow_pickle=False) as data:
+            motions = []
+            for person in people:
+                number, first, last = person["person"], person["start"], person["end"]
+                motion = {key: data[f"{key}_{number}"] for key in ("poses", "trans", "betas")}
+                if motion["trans"].shape != (last - first + 1, 3):
+                    raise ValueError("FBX source range does not match the scene motion")
+                motions.append((number, first, motion))
+            return self._write_motions(motions, outname, int(data["mocap_framerate"]),
+                                       max(p["end"] for p in people), export_mesh, variant_path)
 
-        # Build Mesh
-        faces = self.smpl_data.get("f", None)
-        if faces is None:
-            faces = self.smpl_data.get("faces", None)
-        if faces is None:
-            raise KeyError("SMPLH model missing faces key: expected `f` (preferred) or `faces`.")
-        geo_node = build_mesh_node(
-            scene, v_shaped[0].numpy() * scale, faces,
-            uv_coords=self.uv_coords, uv_faces=self.uv_faces,
-        )
-
-        # Build Skeleton
-        parents = np.array(self.smpl_data["kintree_table"][0]).copy()
+    def _add_motion(self, scene, layer, npz_data, number, start, frame_dur, end, export_mesh, variant_path):
+        poses = np.asarray(npz_data["poses"], dtype=np.float32).reshape(-1, 52, 3)
+        trans = np.asarray(npz_data["trans"], dtype=np.float64)
+        betas = np.asarray(npz_data["betas"], dtype=np.float32)
+        if not len(poses) or trans.shape != (len(poses), 3) or not all(np.isfinite(x).all() for x in (poses, trans, betas)):
+            raise ValueError("Invalid SMPL-H animation for FBX export")
+        betas = np.atleast_2d(betas)[:1, :self.smpl_data["shapedirs"].shape[-1]]
+        offsets, v_shaped = get_offsets_from_beta(torch.from_numpy(betas), self.smpl_data)
+        mesh = v_shaped[0].numpy().astype(np.float64)
+        parents = np.asarray(self.smpl_data["kintree_table"][0], dtype=np.int64).copy()
         parents[0] = -1
-        skel_nodes = build_skeleton_nodes(self.mgr, scene, rest_pose_trans * scale, parents, self.joint_names_ordered)
+        joints = offsets.astype(np.float64)
+        for j in range(1, len(joints)):
+            joints[j] += joints[parents[j]]
+        head_surface = mesh[self.smpl_data["weights"][:, HEAD_JOINT] > .5]
+        basis, tips = _display_frames(joints, parents, head_top_y=head_surface[:, 1].max())
+        floor_offset = np.array([0., -mesh[:, 1].min(), 0.])
+        local_offsets = offsets.astype(np.float64)
+        local_offsets[0] += floor_offset
+        local_offsets[1:] = (basis[parents[1:]].transpose(0, 2, 1) @ local_offsets[1:, :, None])[..., 0]
+        local_rest = basis.copy()
+        local_rest[1:] = basis[parents[1:]].transpose(0, 2, 1) @ basis[1:]
+        # Rotate in each bone's new rest axes. Keeping the animated root in
+        # the original world frame preserves the motion and skinned positions.
+        rot_mats = angle_axis_to_rotation_matrix(torch.from_numpy(poses)).numpy()
+        rotations = basis.transpose(0, 2, 1) @ rot_mats @ basis
+        parent_node = None
+        if number is not None:
+            parent_node = fbx.FbxNode.Create(scene, f"Person {number}")
+            scene.GetRootNode().AddChild(parent_node)
+        skel_nodes = build_skeleton_nodes(self.mgr, scene, local_offsets, parents, FBX_JOINT_NAMES,
+                                          rest_rotations=local_rest, tip_lengths=tips, parent_node=parent_node,
+                                          reference_name="FlowHMR Motion" if number is None else f"FlowHMR Person {number}")
+        if export_mesh:
+            if variant_path is not None:
+                from ..bodymodels.body_variants import fitted_skin
 
-        # Skinning
-        apply_skinning(scene, geo_node, skel_nodes, self.smpl_data["weights"])
+                mesh = fitted_skin(variant_path, mesh.astype(np.float32), joints.astype(np.float32),
+                                   self.smpl_data["weights"], self.smpl_data["faces"], parents)
+            geo_node = build_mesh_node(scene, mesh + floor_offset, self.smpl_data["faces"], uv_coords=self.uv_coords,
+                                       uv_faces=self.uv_faces, parent_node=parent_node,
+                                       node_name="Geometry" if number is None else f"Person {number} Mesh")
+            apply_skinning(scene, geo_node, skel_nodes, self.smpl_data["weights"])
+        else:
+            store_bind_pose(scene, skel_nodes)
 
-        # Animate
-        stack = fbx.FbxAnimStack.Create(scene, "Anim")
-        layer = fbx.FbxAnimLayer.Create(scene, "Layer0")
-        stack.AddMember(layer)
-
-        frame_dur = 1.0 / fps
-
-        # Root Translation: Combine global trans with skeleton root rest pose
-        root_trans_final = np.tile(rest_pose_trans[0] * scale, (len(trans), 1))
-        root_trans_final += trans
-        animate_translation(layer, skel_nodes[0], root_trans_final, frame_dur)
-
-        # Rotations
+        animate_translation(layer, skel_nodes[0], trans + offsets[0], frame_dur, start_frame=start)
         for i, node in enumerate(skel_nodes):
-            animate_rotation_from_rotmats(layer, node, rot_mats[:, i], frame_dur)
+            animate_rotation_from_rotmats(layer, node, rotations[:, i], frame_dur, start_frame=start)
+        stop = start + len(poses) - 1
+        if parent_node is not None and (start or stop < end):
+            # A visibility curve preserves the track interval in FBX-capable scene viewers.
+            curve = parent_node.Visibility.GetCurve(layer, True)
+            keys = [(0, 0.), (start, 1.)] if start else [(0, 1.)]
+            if stop < end:
+                keys.append((stop + 1, 0.))
 
-        if not export_mesh:
-            strip_mesh_geometry(scene)
+            def step_keys(channel, values):
+                channel.KeyModifyBegin()
+                time = fbx.FbxTime()
+                for frame, value in values:
+                    time.SetSecondDouble(frame * frame_dur)
+                    key = channel.KeyAdd(time)[0]
+                    channel.KeySetValue(key, value)
+                    channel.KeySetInterpolation(key, fbx.FbxAnimCurveDef.EInterpolationType.eInterpolationConstant)
+                channel.KeyModifyEnd()
 
-        export_scene_atomic(self.mgr, scene, outname, embed_textures=export_mesh)
-        scene.Destroy()
+            step_keys(curve, keys)
+            # Blender imports transforms but ignores animated FBX visibility. Scale only
+            # the enclosing empty outside the track; keep every active frame at unit scale.
+            hidden = 1e-5
+            scale = {0: hidden if start else 1., start: 1., stop: 1.}
+            if start:
+                scale[start - 1] = hidden
+            if stop < end:
+                scale[stop + 1] = hidden
+            for axis in "XYZ":
+                step_keys(parent_node.LclScaling.GetCurve(layer, axis, True), sorted(scale.items()))
+
+    def _write_motions(self, motions, outname, fps, end, export_mesh, variant_path):
+        if not motions or fps <= 0 or end < 0:
+            raise ValueError("Invalid FBX timeline")
+        scene = fbx.FbxScene.Create(self.mgr, "")
+        try:
+            settings = scene.GetGlobalSettings()
+            settings.SetAxisSystem(fbx.FbxAxisSystem.MayaYUp)
+            settings.SetSystemUnit(fbx.FbxSystemUnit.m)
+            settings.SetOriginalSystemUnit(fbx.FbxSystemUnit.m)
+            settings.SetTimeMode(fbx.FbxTime.ConvertFrameRateToTimeMode(fps))
+            first, last = fbx.FbxTime(), fbx.FbxTime()
+            first.SetSecondDouble(0.)
+            last.SetSecondDouble(end / fps)
+            span = fbx.FbxTimeSpan(first, last)
+            settings.SetTimelineDefaultTimeSpan(span)
+
+            stack = fbx.FbxAnimStack.Create(scene, "Motion")
+            stack.SetLocalTimeSpan(span)
+            stack.SetReferenceTimeSpan(span)
+            layer = fbx.FbxAnimLayer.Create(scene, "BaseLayer")
+            stack.AddMember(layer)
+            for number, start, motion in motions:
+                self._add_motion(scene, layer, motion, number, start, 1.0 / fps, end, export_mesh, variant_path)
+            export_scene_atomic(self.mgr, scene, os.fspath(outname), embed_textures=export_mesh)
+        finally:
+            scene.Destroy()
         return True
 
 
@@ -220,7 +328,7 @@ if __name__ == "__main__":
     parser.add_argument("root", type=str)
     args = parser.parse_args()
 
-    smplh2fbx = SMPLH2FBX(smplh_model_path="./assets/body_models/smplh/neutral/model.npz")
+    smplh2fbx = SMPLH2FBX()
 
     if os.path.isdir(args.root):
         npzfiles = sorted(glob.glob(os.path.join(args.root, "*.npz")))

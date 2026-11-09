@@ -134,7 +134,7 @@ body { display: flex; flex-direction: column; height: 100vh; }
   position: relative; display: inline-flex; flex-shrink: 0; width: 40px; height: 22px; padding: 0;
   border: 0; border-radius: 999px; background: rgba(0, 0, 0, 0.1); cursor: pointer; transition: background 0.3s;
 }
-.toggle[aria-checked="true"] { background: var(--dark); }
+.toggle[aria-checked="true"] { background: var(--active, #4775a8); }
 .toggle-knob {
   position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15); transition: transform 0.3s; pointer-events: none;
@@ -166,18 +166,6 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .file-size { font-size: 12px; color: var(--faint); }
 
 /* ---------------------------------------------------------------- settings */
-.settings-summary {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 4px 0; border-radius: 6px; color: var(--text); cursor: pointer; list-style: none;
-}
-.settings-summary::-webkit-details-marker { display: none; }
-.settings-summary::marker { content: ""; }
-.settings-summary .card-title { margin: 0; color: inherit; }
-.settings-summary:hover { background: var(--line); }
-.settings-summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
-.settings-chevron { width: 18px; height: 18px; flex-shrink: 0; color: var(--muted); transform: rotate(-90deg); }
-.settings-panel[open] > .settings-summary { margin-bottom: 12px; }
-.settings-panel[open] > .settings-summary .settings-chevron { transform: rotate(0deg); }
 .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 4px 0 10px; }
 .setting-label { font-size: 13px; color: #4b5563; }
 .setting-help { font-size: 12px; color: var(--faint); margin-top: 2px; }
@@ -253,10 +241,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .person-meta { font-size: 12px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .person-check {
   position: absolute; right: 12px; top: 50%; transform: translateY(-50%); width: 20px; height: 20px;
-  border-radius: 50%; border: 1.5px solid #d1d5db; background: #fff; color: transparent;
+  border-radius: 4px; border: 1.5px solid #d1d5db; background: #fff; color: transparent;
   display: inline-flex; align-items: center; justify-content: center; transition: all 0.15s;
 }
 .person-check svg { width: 13px; height: 13px; }
+.person:not(.selected) .person-check svg { visibility: hidden; }
 .person.selected .person-check { background: var(--green); border-color: var(--green); color: #fff; }
 
 /* ---------------------------------------------------------------- video preview */
@@ -266,8 +255,9 @@ body { display: flex; flex-direction: column; height: 100vh; }
   border-radius: 10px; overflow: hidden; background: #0f1115;
 }
 .preview-stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
-#previewCanvas { position: absolute; left: 0; top: 0; width: 100%; height: calc(100% - 40px); pointer-events: none; }
+#previewCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 #previewCanvas.pickable { pointer-events: auto; cursor: pointer; }
+#previewVideo[controls] + #previewCanvas { clip-path: inset(0 0 40px); }
 .card.attention { box-shadow: 0 0 0 2px #fbbf24, var(--shadow); }
 
 /* ---------------------------------------------------------------- result / viewer */
@@ -345,7 +335,6 @@ body { display: flex; flex-direction: column; height: 100vh; }
 :root[data-theme="dark"] .btn-primary { background: #e5e7eb; color: #202226; }
 :root[data-theme="dark"] .btn-primary:hover:not(:disabled) { background: #fff; }
 :root[data-theme="dark"] .play { background: #42464f; color: #fff; }
-:root[data-theme="dark"] .toggle[aria-checked="true"] { background: #777f8b; }
 :root[data-theme="dark"] .error { color: #ff9a9f; background: rgba(74, 38, 41, 0.72); }
 :root[data-theme="dark"] .input,
 :root[data-theme="dark"] .select,

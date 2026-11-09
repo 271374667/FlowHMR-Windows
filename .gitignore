@@ -14,8 +14,18 @@ checkpoints
 checkpoints/
 ckpts
 ckpts/
+/models/*
+!/models/README.md
+/third_party/hamer_inference/
 
 # python
+.venv/
+.runtime/
+/runtime/
+.cache/
+logs/
+dist/
+build/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -26,10 +36,31 @@ __pycache__/
 *.pt
 *.fbx
 *.pkl
+*.npz
+*.safetensors
+*.whl
+*.exe
+*.dll
+*.pyd
+*.lnk
+*.zip
+*.bin
 *.tar
 *.tar.gz
 *.log
 *.pid
+
+# Local credentials and input media
+.env
+.env.*
+!.env.example
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.m4v
+!/assets/example/example.mp4
 
 # editors / os
 .vscode/

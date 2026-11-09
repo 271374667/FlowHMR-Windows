@@ -1,91 +1,22 @@
-// "Recent runs" card: jobs of this server session, open / re-run.
-import { $, show, el, formatRelative, STATUS_LABEL } from "./utils.js";
+// Job history. Keep each row and its thumbnail mounted while progress changes.
+import { $, show, el, formatRelative, STATUS_LABEL, jobLabel } from "./utils.js";
 import * as api from "./api.js";
+
+const ACTIVE = new Set(["queued", "running", "waiting_user", "cancel_requested", "uploading"]);
+const STOP = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>';
+const RERUN = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 9.4h5M3 19.6v-5h5m-5 5l3-3a8.2 8.2 0 0014-3.7M4 9.9a8.2 8.2 0 0113.8-3.7L21 9.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 export function initHistory({ onOpen, onRerun, onDeleted }) {
   const list = $("historyList");
-  let current = null;
-  let busy = null;
-  const selected = new Set();
-  const deleteSelected = $("historyDeleteSelected");
-  const deleteAll = $("historyDeleteAll");
+  const deleteSelected = $("historyDeleteSelected"), deleteAll = $("historyDeleteAll");
+  const selected = new Set(), rows = new Map();
+  let current = null, busy = null, refreshVersion = 0, timer = null, hasActive = false;
+  let deletable = 0;
 
   function updateActions() {
     $("historySelectedCount").textContent = selected.size;
     deleteSelected.disabled = busy !== null || selected.size === 0;
-  }
-
-  async function refresh() {
-    let data;
-    try { data = await api.getJobs(); } catch { return; }
-    const { jobs, now } = data;
-    const visibleIds = new Set(jobs.map((j) => j.id));
-    for (const id of selected) if (!visibleIds.has(id)) selected.delete(id);
-    deleteAll.disabled = busy !== null || data.deletable_count === 0;
-    list.innerHTML = "";
-    show("historyEmpty", jobs.length === 0);
-    for (const j of jobs) {
-      const row = el("div", `run${j.id === current ? " current" : ""}`);
-      const active = ["queued", "running", "waiting_user", "cancel_requested", "uploading"].includes(j.status);
-      const canDelete = !active;
-      const check = el("input", "run-select");
-      check.type = "checkbox";
-      check.checked = selected.has(j.id);
-      check.disabled = !canDelete || busy !== null;
-      check.setAttribute("aria-label", `Select ${j.filename} for deletion`);
-      check.addEventListener("change", () => {
-        if (check.checked) selected.add(j.id);
-        else selected.delete(j.id);
-        updateActions();
-      });
-      const open = el("button", "run-open");
-      open.type = "button";
-      const info = el("div", "run-info");
-      info.append(el("div", "run-name", j.filename),
-        el("div", "run-sub", j.recovered ? "Recovered from disk · settings unavailable"
-          : `${formatRelative(j.created, now)} · seed ${j.params.seed} · cfg ${j.params.cfg_scale} · ${j.params.static_camera ? "static camera" : "estimated camera"}`));
-      const tag = el("span", `badge ${j.status}`,
-        j.status === "running" ? `${j.progress}%` : (STATUS_LABEL[j.status] || j.status));
-      open.append(info, tag);
-      open.addEventListener("click", () => onOpen(j.id));
-
-      const action = el("button", "icon-btn");
-      action.type = "button";
-      if (active) {
-        action.title = j.status === "cancel_requested" ? "Stopping this run" : "Stop this run";
-        action.setAttribute("aria-label", `${action.title}: ${j.filename}`);
-        action.disabled = busy !== null || j.status === "cancel_requested";
-        action.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>';
-        action.addEventListener("click", async (e) => {
-          e.stopPropagation();
-          if (!window.confirm(`Stop processing ${j.filename}?`)) return;
-          busy = `stop:${j.id}`;
-          setError("");
-          refresh();
-          try { await api.cancelJob(j.id); } catch (err) { setError(err.message || "Could not stop this run"); }
-          busy = null;
-          refresh();
-        });
-      } else {
-        action.title = "Re-run with the current settings";
-        action.setAttribute("aria-label", `Re-run ${j.filename}`);
-        action.disabled = busy !== null;
-        action.innerHTML = '<svg viewBox="0 0 24 24"><path d="M16.02 9.35h4.99M2.98 19.64v-4.99m0 0h4.99m-4.99 0l3.18 3.18a8.25 8.25 0 0013.8-3.7M4.03 9.87a8.25 8.25 0 013.18-3.7l3.18 3.18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-        if (busy === j.id) action.classList.add("spin");
-        action.addEventListener("click", async (e) => {
-          e.stopPropagation();
-          busy = j.id;
-          setError("");
-          refresh();
-          try { await onRerun(j.id); } catch (err) { setError(err.message || "Re-run failed"); }
-          busy = null;
-          refresh();
-        });
-      }
-      row.append(check, open, action);
-      list.append(row);
-    }
-    updateActions();
+    deleteAll.disabled = busy !== null || deletable === 0;
   }
 
   function setError(msg) {
@@ -93,15 +24,109 @@ export function initHistory({ onOpen, onRerun, onDeleted }) {
     show("historyError", !!msg);
   }
 
+  function createRow(job) {
+    const row = el("div", "run"), check = el("input", "run-select"), open = el("button", "run-open");
+    const thumb = el("span", "run-thumb"), image = el("img"), info = el("div", "run-info");
+    const name = el("div", "run-name", job.filename), sub = el("div", "run-sub");
+    const tag = el("span", "badge"), action = el("button", "icon-btn");
+    const { id } = job;
+    const entry = { row, check, open, image, name, sub, tag, action, status: null, active: null, person: undefined, failedThumb: false };
+    row.dataset.job = id;
+    check.type = "checkbox";
+    check.addEventListener("change", () => {
+      if (check.checked) selected.add(id); else selected.delete(id);
+      updateActions();
+    });
+    open.type = action.type = "button";
+    open.addEventListener("click", () => onOpen(id));
+    image.alt = "";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.addEventListener("load", () => { entry.failedThumb = false; thumb.classList.add("ready"); });
+    image.addEventListener("error", () => { entry.failedThumb = true; thumb.classList.remove("ready"); });
+    action.addEventListener("click", async () => {
+      if (busy !== null) return;
+      const stopping = entry.active;
+      busy = stopping ? `stop:${id}` : id;
+      setError("");
+      void refresh();
+      try { await (stopping ? api.cancelJob(id) : onRerun(id)); }
+      catch (err) { setError(err.message || (stopping ? "停止任务失败" : "重跑失败")); }
+      finally { busy = null; void refresh(); }
+    });
+    info.append(name, sub);
+    thumb.append(image);
+    open.append(thumb, info, tag);
+    row.append(check, open, action);
+    rows.set(id, entry);
+    return entry;
+  }
+
+  function updateRow(entry, job, now) {
+    const { row, check, open, image, name, sub, tag, action } = entry;
+    const active = ACTIVE.has(job.status);
+    const person = job.selected_person ?? null;
+    if (entry.person !== person || (entry.status !== job.status && entry.failedThumb)) {
+      entry.person = person;
+      image.src = `${api.thumbnailUrl(job.id)}?person=${person ?? ""}&stage=${job.status}`;
+    }
+    const label = jobLabel(job);
+    name.textContent = open.title = label;
+    check.setAttribute("aria-label", `选中 ${label} 以删除`);
+    if (entry.active !== active) action.innerHTML = active ? STOP : RERUN;
+    entry.status = job.status;
+    entry.active = active;
+    row.classList.toggle("current", job.id === current);
+    check.checked = selected.has(job.id);
+    check.disabled = active || busy !== null;
+    const correction = job.params.postprocess
+      ? ` · ${job.params.correction_preset === "strong" ? "加强锁脚" : "标准锁脚"} · ${job.params.correction_floor_m == null ? "自动" : "手动"}地面` : "";
+    sub.textContent = job.recovered ? "从磁盘恢复" : `${formatRelative(job.created, now)}${correction} · CFG ${job.params.cfg_scale} · ${job.params.steps} 步`;
+    sub.title = sub.textContent;
+    tag.className = `badge ${job.status}`;
+    tag.textContent = job.status === "running" ? `${job.progress}%` : STATUS_LABEL[job.status] || job.status;
+    action.title = active ? (job.status === "cancel_requested" ? "正在停止" : "停止这次任务") : "用当前设置重跑";
+    action.setAttribute("aria-label", `${action.title}: ${label}`);
+    action.disabled = busy !== null || job.status === "cancel_requested";
+    action.classList.toggle("spin", busy === job.id);
+  }
+
+  async function refresh() {
+    clearTimeout(timer);
+    const version = ++refreshVersion;
+    let data;
+    try { data = await api.getJobs(); } catch {
+      if (version === refreshVersion && hasActive) timer = setTimeout(refresh, 3000);
+      return;
+    }
+    const { jobs, now } = data;
+    if (version !== refreshVersion) return jobs;
+    hasActive = jobs.some((job) => ACTIVE.has(job.status));
+    if (hasActive) timer = setTimeout(refresh, 2000);
+    const visible = new Set(jobs.map((job) => job.id));
+    for (const id of selected) if (!visible.has(id)) selected.delete(id);
+    for (const [id, entry] of rows) {
+      if (!visible.has(id)) { entry.row.remove(); rows.delete(id); }
+    }
+    deletable = data.deletable_count;
+    $("historySummary").textContent = jobs.length ? `· ${jobs.length} 条` : "";
+    show("historyEmpty", jobs.length === 0);
+    jobs.forEach((job, i) => {
+      const entry = rows.get(job.id) ?? createRow(job);
+      updateRow(entry, job, now);
+      if (list.children[i] !== entry.row) list.insertBefore(entry.row, list.children[i] ?? null);
+    });
+    updateActions();
+    return jobs;
+  }
+
   $("historyRefresh").addEventListener("click", refresh);
   deleteSelected.addEventListener("click", async () => {
     const ids = [...selected];
-    if (!ids.length || !window.confirm(`Delete ${ids.length} selected run${ids.length === 1 ? "" : "s"} and their files?`)) return;
-    await removeRuns(ids);
+    if (ids.length && window.confirm(`删除选中的 ${ids.length} 条任务及其文件？`)) await removeRuns(ids);
   });
   deleteAll.addEventListener("click", async () => {
-    if (!window.confirm("Delete all finished and failed runs and their files? Runs still processing will be kept.")) return;
-    await removeRuns();
+    if (window.confirm("删除所有已结束的任务及其文件？正在处理的任务会保留。")) await removeRuns();
   });
 
   async function removeRuns(ids) {
@@ -111,16 +136,14 @@ export function initHistory({ onOpen, onRerun, onDeleted }) {
     try {
       const result = await api.deleteJobs(ids);
       selected.clear();
-      if (result.skipped.length) setError(`${result.deleted.length} deleted; ${result.skipped.length} could not be deleted.`);
+      if (result.skipped.length) setError(`已删除 ${result.deleted.length} 条，${result.skipped.length} 条未删除。`);
       onDeleted(result.deleted);
-      await refresh();
-    } catch (err) {
-      setError(err.message || "Could not delete runs");
-    } finally {
-      busy = null;
-      await refresh();
-    }
+    } catch (err) { setError(err.message || "删除任务失败"); }
+    finally { busy = null; await refresh(); }
   }
 
-  return { refresh, setCurrent(id) { current = id; } };
+  return { refresh, setCurrent(id) {
+    current = id;
+    for (const [jobId, entry] of rows) entry.row.classList.toggle("current", jobId === id);
+  } };
 }

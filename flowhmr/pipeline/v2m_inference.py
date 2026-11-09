@@ -1,4 +1,5 @@
 import os
+import json
 import shutil
 import subprocess
 import time
@@ -11,6 +12,9 @@ import numpy as np
 import torch
 import yaml
 from torch import Tensor
+
+from flowhmr.utils.runtime_capabilities import MAX_MOTION_FRAMES
+from flowhmr.utils.runtime_image_io import write_image
 
 
 # Enums & Dataclasses
@@ -30,6 +34,7 @@ class StageName(str, Enum):
     SAM_EXTRACT = "sam_extract"
     FEATURE_EXTRACT = "feature_extract"
     GENERATION = "generation"
+    HAMER = "hamer"
 
 
 @dataclass
@@ -158,20 +163,22 @@ def build_feature_dict(sam_tokens: Tensor, camera_RT: Tensor, device: torch.devi
 
 
 def _limit_track_frames(bbox_path: str, max_frames: int | None,
-                        dependent_paths: tuple[str, ...] = ()) -> None:
-    """Apply the video-frame limit to an inclusive track, retaining its full boxes."""
+                        dependent_paths: tuple[str, ...] = (), *, start_frame=0, end_frame=None) -> None:
+    """Intersect the requested source range with the full detected track."""
     with np.load(bbox_path) as data:
         payload = {key: data[key] for key in data.files}
     full_bbox = payload.get("unclipped_bbox", payload["bbox"])
     full_range = payload.get("unclipped_start_end", payload["start_end"])
-    start, full_end = (int(value) for value in full_range)
-    if start < 0 or full_end < start or len(full_bbox) != full_end - start + 1:
+    full_start, full_end = (int(value) for value in full_range)
+    if full_start < 0 or full_end < full_start or len(full_bbox) != full_end - full_start + 1:
         raise ValueError(f"Invalid bbox track range: {full_range}, boxes={len(full_bbox)}")
     end = min(full_end, int(max_frames) - 1) if max_frames is not None and max_frames > 0 else full_end
+    start = max(full_start, start_frame)
+    if end_frame is not None:
+        end = min(end, end_frame)
     if start > end:
         raise ValueError(
-            f"Selected person starts at frame {start}, outside the first {max_frames} frames. "
-            "Increase Max frames or select a person visible earlier."
+            f"处理区间与人物轨迹（第 {full_start + 1}–{full_end + 1} 帧）不重叠。请调整区间或更换人物。"
         )
     if np.array_equal(payload["start_end"], [start, end]):
         return
@@ -179,7 +186,7 @@ def _limit_track_frames(bbox_path: str, max_frames: int | None,
     # Retain the complete selected track so a later run can increase/remove the limit.
     payload["unclipped_bbox"] = full_bbox
     payload["unclipped_start_end"] = np.asarray(full_range, dtype=np.int64)
-    payload["bbox"] = full_bbox[:end - start + 1]
+    payload["bbox"] = full_bbox[start - full_start:end - full_start + 1]
     payload["start_end"] = np.array([start, end], dtype=np.int64)
     # SAM features depend on both the selected range and the camera intrinsics.
     for path in dependent_paths:
@@ -187,6 +194,24 @@ def _limit_track_frames(bbox_path: str, max_frames: int | None,
             os.remove(path)
     np.savez(bbox_path, **payload)
     print(f"  [bbox] processing frames [{start},{end}] ({end - start + 1} frames)")
+
+
+def plan_sam_batch(device, frames, requested=None):
+    """Estimate the initial SAM batch from memory available to this worker now."""
+    device = torch.device(device)
+    info = {"requested": requested, "actual": min(frames, requested or 16), "reused": False, "retries": 0}
+    if device.type == "cuda":
+        free, total = torch.cuda.mem_get_info(device)
+        reusable = max(0, torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+        available = min(total, free + reusable)
+        info.update(free_mib=free // (1024 ** 2), total_mib=total // (1024 ** 2))
+        if requested is None:
+            # Warm local runs use roughly 0.23 GiB per additional frame; allow
+            # extra headroom for both hand batches, allocator and other apps.
+            reserve = max(1536 * 1024 ** 2, int(total * 0.10))
+            budget = min(available - reserve, int(total * 0.78) - (total - available))
+            info["actual"] = min(frames, max(1, budget // (384 * 1024 ** 2)))
+    return info
 
 
 def forward_smpl_batch(body_model, rot6d, shapes, trans):
@@ -260,7 +285,7 @@ def save_fbx(output: dict, length: int, output_path: str, save_npz: bool = True,
     poses = rotation_matrix_to_angle_axis(rotations)
 
     poses_np = poses.cpu().numpy()
-    trans_np = trans.cpu().numpy()
+    trans_np = trans.cpu().numpy().copy()  # The export coordinate conversion is in place.
 
     # Rotate 180° around Y axis before saving
     _rotate_smplh_params_y180(poses_np, trans_np)
@@ -295,8 +320,8 @@ def save_fbx(output: dict, length: int, output_path: str, save_npz: bool = True,
         from flowhmr.core.export.smplh2fbx import SMPLH2FBX
     except ImportError:  # fbxsdkpy not installed: npz only
         return
-    smplh2fbx = SMPLH2FBX()
-    smplh2fbx.convert_npz_to_fbx(params, output_path, export_mesh=export_mesh)
+    with SMPLH2FBX() as smplh2fbx:
+        smplh2fbx.convert_npz_to_fbx(params, output_path, export_mesh=export_mesh)
 
 
 # Bbox visualization helpers
@@ -387,7 +412,7 @@ def save_sam_sparse_vis(
                 rend = visualize_sample_together(frame_bgr, outputs, faces)
                 rend = np.clip(rend, 0, 255).astype(np.uint8)
                 out_path = os.path.join(output_dir, f"sam_vis_frame{i:06d}.jpg")
-                cv2.imwrite(out_path, rend)
+                write_image(out_path, rend)
                 saved += 1
         i += 1
     cap.release()
@@ -721,7 +746,7 @@ class V2MInferenceEngine:
         crop = frame[y1:y2, x1:x2]
 
         thumb_path = os.path.join(sub_dir, f"person_{person_id}_thumb.jpg")
-        cv2.imwrite(thumb_path, crop)
+        write_image(thumb_path, crop)
         return thumb_path
 
     def _trim_video(self, video_path: str, frame_start: int, frame_end: int,
@@ -887,16 +912,23 @@ class V2MInferenceEngine:
     def process_video(self, video_path: str, output_dir: str, *,
                       seed: int = 0, cfg_scale: float = 1.0,
                       max_frames: int = None,
+                      start_frame: int = 0, end_frame: int | None = None,
+                      smoothing_frames: float = 0,
+                      hamer: bool = False,
+                      hamer_stride: int = 1,
                       vggt_frame_interval: int = 1,
                       static_camera: bool = False,
                       person_selector: Callable = None,
                       progress_callback: Callable[[StageName, int, str], None] = None,
                       cancel_check: Callable[[], None] = None,
-                      sam_chunk_size: int = 16) -> str:
+                      sam_chunk_size: int | None = 16,
+                      details_callback: Callable[[dict], None] = None) -> str:
         """Video -> SMPL-H motion.
 
         static_camera: skip VGGT and use a fixed pose with default intrinsics.
         sam_chunk_size: frames per SAM body pass; both hands are batched together.
+        hamer: refine the selected person's fingers before exporting the motion.
+        hamer_stride: interval in video frames between hand predictions; fill gaps with rotation interpolation.
 
         person_selector: optional ``f(result, candidates, default) -> candidate index``,
         called after tracking when more than one person track (>= 15 frames) is found, e.g.
@@ -904,9 +936,16 @@ class V2MInferenceEngine:
         returning None / an out-of-range index keeps ``default``. Without it the longest /
         largest track is used.
         """
-        if isinstance(sam_chunk_size, bool) or not isinstance(sam_chunk_size, int) or sam_chunk_size < 1:
-            raise ValueError("sam_chunk_size must be a positive integer")
+        if sam_chunk_size is not None and (type(sam_chunk_size) is not int or sam_chunk_size < 1):
+            raise ValueError("sam_chunk_size must be a positive integer or automatic")
+        from flowhmr.utils.runtime_hamer import hamer_available, load_hand_boxes, refine_fingers, MISSING_HAMER
         from flowhmr.utils.runtime_video_processing import VideoProcessor
+
+        extract_hand_boxes = getattr(self.sam_extractor, "extract_video_hand_boxes", None)
+        if hamer and not hamer_available(self.device):
+            raise RuntimeError(MISSING_HAMER)
+        if hamer and extract_hand_boxes is None:
+            raise RuntimeError("HaMeR 需要单 GPU 的 SAM 特征提取模式。")
 
         def _pcb(stage_name, progress, desc):
             if cancel_check is not None:
@@ -914,7 +953,11 @@ class V2MInferenceEngine:
             if progress_callback is not None:
                 progress_callback(stage_name, progress, desc)
 
-        vggt_frame_interval = max(1, int(vggt_frame_interval))
+        def _details(**details):
+            if details_callback is not None:
+                details_callback(details)
+
+        vggt_frame_interval = max(0, int(vggt_frame_interval))
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         sub_dir = os.path.join(output_dir, video_name)
         os.makedirs(sub_dir, exist_ok=True)
@@ -923,20 +966,31 @@ class V2MInferenceEngine:
         feature_suffix = "_static" if static_camera else ""
         camera_mode = "static" if static_camera else "vggt"
         feat_pt_path = os.path.join(sub_dir, f"{video_name}_sam3d_feat{feature_suffix}.pt")
+        batch_path = feat_pt_path + ".batch.json"
+        hand_boxes_path = feat_pt_path + ".hands.npy"
         camera_npz_path = os.path.join(sub_dir, f"{video_name}_{camera_mode}_camera.npz")
 
         print(f"\n  === Step 1: Bbox ===")
         _pcb(StageName.DETECTION, 0, "Starting bbox extraction")
 
+        working_video = self.proc.transcode(video_path, backup_dir=sub_dir, force_fps=30)
+        video_meta = VideoProcessor.get_video_meta(working_video)
+        _details(source_frames=video_meta.total_frames or None)
+        if video_meta.total_frames > 0 and start_frame >= video_meta.total_frames:
+            raise ValueError(f"起始帧超出素材范围（共 {video_meta.total_frames} 帧）。")
+        last_requested = end_frame
+        if max_frames is not None and max_frames > 0:
+            last_requested = min(last_requested, max_frames - 1) if last_requested is not None else max_frames - 1
+
         if os.path.exists(bbox_npz_path):
             print(f"  [bbox] skip (exists): {bbox_npz_path}")
-            working_video = self.proc.transcode(video_path, backup_dir=sub_dir, force_fps=30)
             _pcb(StageName.DETECTION, 100, "Bbox cached")
         else:
-            working_video = self.proc.transcode(video_path, backup_dir=sub_dir, force_fps=30)
             _pcb(StageName.DETECTION, 20, "Transcoded, detecting")
 
             result = self.proc.detect_and_track(working_video)
+            if result.total_frames != video_meta.total_frames:
+                _details(source_frames=result.total_frames)
             _pcb(StageName.DETECTION, 60, f"Found {len(result.tracks)} person(s)")
 
             if not result.tracks:
@@ -944,9 +998,15 @@ class V2MInferenceEngine:
                 print(f"  [bbox] WARN no_tracks -> full-image bbox x {result.total_frames} frames")
             else:
                 track_idx = VideoProcessor.select_best_track(result)
+                eligible = [i for i, t in enumerate(result.tracks)
+                            if t.frames.max() >= start_frame and (last_requested is None or t.frames.min() <= last_requested)]
+                if not eligible:
+                    raise ValueError("处理区间里没有检测到人物，请调整时间轴的起止帧。")
+                if track_idx not in eligible:
+                    track_idx = max(eligible, key=lambda i: (result.tracks[i].length, result.tracks[i].avg_area))
                 # Fragments shorter than this (ByteTrack id switches, passers-by) are not offered.
                 min_len = 15
-                offered = [i for i, t in enumerate(result.tracks) if t.length >= min_len or i == track_idx]
+                offered = [i for i in eligible if result.tracks[i].length >= min_len or i == track_idx]
                 if person_selector is not None and len(offered) > 1:
                     candidates = []
                     for i in offered:
@@ -955,6 +1015,8 @@ class V2MInferenceEngine:
                         candidates.append({
                             "index": len(candidates), "track_index": i, "track_id": int(t.track_id),
                             "start": int(t.frames.min()), "end": int(t.frames.max()),
+                            "preview_start": max(start_frame, int(t.frames.min())),
+                            "preview_end": min(last_requested, int(t.frames.max())) if last_requested is not None else int(t.frames.max()),
                             "num_frames": int(t.length), "avg_area": float(t.avg_area),
                             "frames": t.frames[order].astype(int).tolist(),
                             "boxes": np.round(t.bboxes[order].astype(np.float64), 1).tolist(),
@@ -975,9 +1037,11 @@ class V2MInferenceEngine:
             _pcb(StageName.DETECTION, 100, "Bbox done")
 
         _limit_track_frames(
-            bbox_npz_path, max_frames,
+            bbox_npz_path, max_frames, start_frame=start_frame, end_frame=end_frame,
             dependent_paths=tuple(os.path.join(sub_dir, f"{video_name}_{suffix}") for suffix in (
                 "vggt_camera.npz", "static_camera.npz", "sam3d_feat.pt", "sam3d_feat_static.pt",
+                "sam3d_feat.pt.batch.json", "sam3d_feat_static.pt.batch.json",
+                "sam3d_feat.pt.hands.npy", "sam3d_feat_static.pt.hands.npy",
             )),
         )
 
@@ -989,16 +1053,25 @@ class V2MInferenceEngine:
             start_end_arr = data["start_end"].astype(np.int64)
         s, e = int(start_end_arr[0]), int(start_end_arr[1])
         t_track = e - s + 1
+        _details(track_range=[s, e])
+        if t_track > MAX_MOTION_FRAMES:
+            raise ValueError(f"区间内人物轨迹有 {t_track} 帧，模型单段支持 {MAX_MOTION_FRAMES} 帧。请在时间轴缩短处理区间。")
 
         from flowhmr.utils.runtime_vggt_camera import (
-            extract_vggt_camera, make_static_camera, _vggt_opencv_to_yup_rt,
+            camera_intervals, extract_vggt_camera, extract_vggt_camera_isolated,
+            make_static_camera, _vggt_opencv_to_yup_rt,
         )
 
         camera_stamp = os.stat(camera_npz_path).st_mtime_ns if os.path.exists(camera_npz_path) else None
         if static_camera:
-            meta = VideoProcessor.get_video_meta(working_video)
             camera_result = make_static_camera(
-                (meta.height, meta.width), frame_range=(s, e), output_npz=camera_npz_path,
+                (video_meta.height, video_meta.width), frame_range=(s, e), output_npz=camera_npz_path,
+            )
+        elif cancel_check is not None:
+            camera_result = extract_vggt_camera_isolated(
+                working_video, output_npz=camera_npz_path, frame_range=(s, e),
+                expected_len=t_track, device=self.device, frame_interval=vggt_frame_interval,
+                cancel_check=cancel_check, on_progress=lambda message: _pcb(StageName.CAMERA, 10, message),
             )
         else:
             camera_result = extract_vggt_camera(
@@ -1007,11 +1080,14 @@ class V2MInferenceEngine:
                 frame_range=(s, e),
                 expected_len=t_track,
                 device=self.device,
-                frame_interval=vggt_frame_interval,
+                frame_interval=camera_intervals(t_track, vggt_frame_interval)[0],
             )
-        if camera_stamp != os.stat(camera_npz_path).st_mtime_ns and os.path.exists(feat_pt_path):
-            os.remove(feat_pt_path)
-            print("  [sam] camera intrinsics changed, recomputing features")
+        if camera_stamp != os.stat(camera_npz_path).st_mtime_ns:
+            if os.path.exists(feat_pt_path):
+                os.remove(feat_pt_path)
+                print("  [sam] camera intrinsics changed, recomputing features")
+            if os.path.exists(hand_boxes_path):
+                os.remove(hand_boxes_path)
         _pcb(StageName.CAMERA, 100, "Static camera: estimation skipped" if static_camera else "VGGT camera ready")
 
         # ==== Step 3: SAM feature extraction ====
@@ -1029,20 +1105,29 @@ class V2MInferenceEngine:
                 del cached_tokens
             except Exception as exc:
                 print(f"  [sam] cached features could not be loaded ({exc}), recomputing")
+        need_hand_boxes = hamer and load_hand_boxes(hand_boxes_path, t_track) is None
         if feature_cached:
+            batch = {"requested": sam_chunk_size, "actual": min(t_track, sam_chunk_size) if sam_chunk_size else None}
+            try:
+                with open(batch_path, encoding="utf-8") as f:
+                    cached_batch = json.load(f)
+                if isinstance(cached_batch, dict) and cached_batch.get("requested") == sam_chunk_size:
+                    batch.update(cached_batch)
+            except (OSError, ValueError):
+                pass
+            _details(sam_batch={**batch, "reused": True})
             print(f"  [sam] skip (exists): {feat_pt_path}")
+        if feature_cached and not need_hand_boxes:
             _pcb(StageName.FEATURE_EXTRACT, 100, "SAM cached")
         else:
-            if os.path.exists(feat_pt_path):
+            if feature_cached:
+                print("  [sam] cached tokens have no hand boxes; recovering boxes only")
+            elif os.path.exists(feat_pt_path):
                 print(f"  [sam] invalid cached features, expected ({t_track}, 3072); recomputing")
-            data = np.load(bbox_npz_path)
-            bbox_track = data["bbox"].astype(np.float32)
-            start_end_arr = data["start_end"].astype(np.int64)
-            s, e = int(start_end_arr[0]), int(start_end_arr[1])
-            t_track = e - s + 1
+            with np.load(bbox_npz_path) as data:
+                bbox_track = data["bbox"].astype(np.float32)
 
-            meta = VideoProcessor.get_video_meta(working_video)
-            total_frames = meta.total_frames
+            total_frames = video_meta.total_frames
             if total_frames <= 0:
                 cap = cv2.VideoCapture(working_video)
                 total_frames = 0
@@ -1078,26 +1163,54 @@ class V2MInferenceEngine:
             def _sam_progress(stage, current, total, message):
                 if total and total > 0:
                     pct = min(95, int(current / total * 95))
-                    _pcb(StageName.FEATURE_EXTRACT, pct, f"SAM: {current}/{total} frames")
+                    desc = (f"正在补提取手框 · {current} / {total} 帧" if feature_cached
+                            else f"SAM: {current}/{total} frames")
+                    _pcb(StageName.FEATURE_EXTRACT, pct, desc)
 
-            tokens_full = self.sam_extractor.extract_video_tokens(
-                working_video,
+            batch = plan_sam_batch(self.device, t_track, sam_chunk_size)
+            if not feature_cached:
+                _details(sam_batch=batch.copy())
+            print(f"  [sam] {'auto' if sam_chunk_size is None else 'manual'} batch={batch['actual']}, "
+                  f"free={batch.get('free_mib', '?')} MiB of {batch.get('total_mib', '?')} MiB")
+
+            def _reduce_batch(size):
+                batch.update(actual=size, retries=batch["retries"] + 1)
+                if not feature_cached:
+                    _details(sam_batch=batch.copy())
+                print(f"  [sam] CUDA OOM: continuing with batch={size}")
+
+            sam_args = dict(
                 bbox_xyxy=bbox_full_t,
                 K_all=K_all,
-                token_dim=3072,
                 max_frames=max_frames_needed,
+                start_frame=s,
                 progress_cb=_sam_progress,
-                frame_batch_size=sam_chunk_size,
+                frame_batch_size=batch["actual"],
+                on_oom_reduce=_reduce_batch if sam_chunk_size is None else None,
             )
-
-            tokens = tokens_full[s:e + 1].contiguous().cpu().to(torch.float32)
-            if tokens.shape != (t_track, 3072):
-                raise ValueError(
-                    f"SAM returned {tuple(tokens.shape)} for track [{s},{e}], "
-                    f"expected ({t_track}, 3072); incomplete features were not cached."
-                )
-            torch.save(tokens, feat_pt_path)
-            print(f"  [sam] saved -> {feat_pt_path}  (shape={tuple(tokens.shape)})")
+            if feature_cached:
+                hand_boxes = extract_hand_boxes(working_video, **sam_args)
+            else:
+                box_chunks = []
+                if extract_hand_boxes is not None:
+                    sam_args["hand_boxes_out"] = box_chunks
+                tokens = self.sam_extractor.extract_video_tokens(working_video, token_dim=3072, **sam_args)
+                tokens = tokens.contiguous().cpu().to(torch.float32)
+                if tokens.shape != (t_track, 3072):
+                    raise ValueError(
+                        f"SAM returned {tuple(tokens.shape)} for track [{s},{e}], "
+                        f"expected ({t_track}, 3072); incomplete features were not cached."
+                    )
+                hand_boxes = np.concatenate(box_chunks) if box_chunks else None
+            if hand_boxes is not None:
+                if hand_boxes.shape != (t_track, 2, 4):
+                    raise ValueError("SAM hand boxes do not match the selected track")
+                np.save(hand_boxes_path, hand_boxes)
+            if not feature_cached:
+                torch.save(tokens, feat_pt_path)
+                with open(batch_path, "w", encoding="utf-8") as f:
+                    json.dump(batch, f)
+                print(f"  [sam] saved -> {feat_pt_path}  (shape={tuple(tokens.shape)})")
             _pcb(StageName.FEATURE_EXTRACT, 100, "SAM done")
 
         # ==== Step 4: Generation ====
@@ -1131,7 +1244,14 @@ class V2MInferenceEngine:
                 cfg_scale=cfg_scale,
                 step_callback=cancel_check,
             )
+        del feature_dict
         _pcb(StageName.GENERATION, 50, "ODE sampling done, exporting")
+
+        if smoothing_frames:
+            from flowhmr.utils.runtime_motion_filter import smooth_motion
+            _pcb(StageName.GENERATION, 55, "正在平滑动作")
+            output = smooth_motion(output, smoothing_frames)
+            print(f"  [gen] smoothing sigma={smoothing_frames:g} frames")
 
         origin_output = {k: v.clone() if isinstance(v, Tensor) else v
                         for k, v in output.items()}
@@ -1153,11 +1273,32 @@ class V2MInferenceEngine:
                  save_npz=True, export_mesh=True)
         _pcb(StageName.GENERATION, 70, "Origin FBX saved")
 
+        final_output = origin_output
         if self.postprocess is not None:
-            output = self.postprocess.run(output)
-            save_fbx(output, length=T, output_path=final_fbx_path,
+            _pcb(StageName.GENERATION, 75, "正在修正脚底接触")
+            final_output = self.postprocess.run(output, cancel_check=cancel_check)
+        if hamer:
+            _pcb(StageName.GENERATION, 100, "动作生成完成")
+            _pcb(StageName.HAMER, 0, "正在启动 HaMeR 手指精修")
+
+            def _hamer_progress(current, total, message):
+                if current == total:
+                    message = f"正在整理手指精修结果 · {total} / {total} 帧"
+                _pcb(StageName.HAMER, min(99, 100 * current // total), message)
+
+            final_output, report = refine_fingers(
+                working_video, hand_boxes_path, s, final_output, device=self.device,
+                stride=hamer_stride, cancel_check=cancel_check, on_progress=_hamer_progress,
+            )
+            _details(hamer_report=report)
+            _pcb(StageName.HAMER, 99, "正在保存手指精修结果")
+        if self.postprocess is not None or hamer:
+            save_fbx(final_output, length=T, output_path=final_fbx_path,
                      save_npz=True, export_mesh=True)
-        _pcb(StageName.GENERATION, 100, "Generation complete")
+        if hamer:
+            _pcb(StageName.HAMER, 100, "手指精修完成")
+        else:
+            _pcb(StageName.GENERATION, 100, "Generation complete")
 
 
         return sub_dir

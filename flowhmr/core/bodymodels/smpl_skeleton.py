@@ -5,6 +5,7 @@ import os
 from .lbs_function import blend_shapes, batch_rigid_transform, batch_rigid_transform_global, lbs, batch_rodrigues, transform_mat
 from ..math.geometry import angle_axis_to_rotation_matrix, rotation_matrix_to_angle_axis
 from ..math.geometry import rot6d_to_rotation_matrix
+from ...model_files import SMPLH_FILES, resolve_model
 
 
 def to_tensor(array, dtype=torch.float32, device=torch.device("cpu")):
@@ -29,6 +30,8 @@ def read_pickle(name):
 
 
 def load_model_data(model_path):
+    if model_path is None:
+        model_path = resolve_model(SMPLH_FILES["neutral"])
     model_path = os.path.abspath(model_path)
     assert os.path.exists(model_path), "Path {} does not exist!".format(model_path)
     if model_path.endswith(".npz"):
@@ -297,7 +300,7 @@ class SMPLSkeleton(torch.nn.Module):
         parents[0] = -1
         self.register_buffer("parents", parents)
 
-    def __init__(self, model_path="assets/body_models/smplh/neutral/model.npz", max_shape=-1):
+    def __init__(self, model_path=None, max_shape=-1):
         super().__init__()
         model = load_model_data(model_path)
         if "hands_meanr" in model:
@@ -358,7 +361,7 @@ class SMPLSkeleton(torch.nn.Module):
 
 
 class SMPLMesh(SMPLSkeleton):
-    def __init__(self, model_path="assets/body_models/smplh/neutral/model.npz", max_shape=-1):
+    def __init__(self, model_path=None, max_shape=-1):
         torch.nn.Module.__init__(self)
         model = load_model_data(model_path)
         # J_regressor: (nJoints, nVertices)
@@ -499,7 +502,7 @@ class SMPLMesh(SMPLSkeleton):
 class SMPLMeshSparseKeypoints(SMPLMesh):
     def __init__(
         self,
-        model_path="assets/body_models/smplh/neutral/model.npz",
+        model_path=None,
         max_shape=-1,
         J_regressor_sparse="assets/body_models/J_regressor_body25.npy",
     ):
@@ -781,7 +784,7 @@ def process_r_t(R_transform, global_orient, transl, j_shaped):
     return global_orient_new.cpu().numpy(), transl_new.cpu().numpy()
 
 if __name__ == "__main__":
-    body_model = SMPLMesh(model_path="assets/body_models/smplh/neutral/model.npz")
+    body_model = SMPLMesh()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     body_model.to(device)
     num_frames = 360
@@ -852,7 +855,7 @@ if __name__ == "__main__":
     print("model weights: fp32 | input params: fp32 vs fp16->fp32")
     print("=" * 60)
 
-    body_model_test = SMPLMesh(model_path="assets/body_models/smplh/neutral/model.npz")
+    body_model_test = SMPLMesh()
     body_model_test.to(device).float()
 
     angle_configs = {

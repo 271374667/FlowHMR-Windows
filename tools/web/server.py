@@ -1,7 +1,7 @@
 """FlowHMR web demo: upload a video, get SMPL-H motion, inspect it in a 3D viewer.
 
 Launch (from the repo root):
-    python app.py --ckpt checkpoints/flowhmr_latest/flowhmr_latest.ckpt --port 8080
+    python app.py --ckpt models/flowhmr_latest/flowhmr_latest.ckpt --port 8080
 then open http://<host>:8080
 
 Pipeline per job (runs on one GPU, jobs are queued):
@@ -10,24 +10,44 @@ Pipeline per job (runs on one GPU, jobs are queued):
 """
 import argparse
 import copy
+import hashlib
 import json
+import math
 import os
 import queue
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import uuid
+from collections import defaultdict
+from functools import wraps
+from importlib.util import find_spec
+from pathlib import Path
+from urllib.parse import urlsplit
+from zipfile import BadZipFile
 
 import numpy as np
-import torch
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 
 WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(WEB_DIR))
 sys.path.insert(0, REPO_ROOT)
+
+from flowhmr.utils.runtime_capabilities import MAX_MOTION_FRAMES, SOLE_FIT_REFERENCE_STRENGTH, native_correction_available
+from flowhmr.utils.runtime_hamer import hamer_available, HAMER_STRIDES, MISSING_HAMER
+from flowhmr.utils.runtime_preview_inspection import PreviewInspection
+from flowhmr.utils.runtime_preview_thumbnail import ensure_thumbnail
+from flowhmr.core.bodymodels.body_variants import available_variants, model_path, write_preview_vertices
+from flowhmr.model_files import (
+    SMPLH_FILES, core_model_paths, ensure_model_folders, file_present, flowhmr_paths, missing_model_paths, resolve_model,
+)
+from flowhmr.model_inventory import model_inventory
+from flowhmr.model_downloads import ACTIVE_DOWNLOAD, DownloadError, ModelDownloads, missing_downloads
+from flowhmr.runtime_environments import RUNTIME
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 STAGES = [
@@ -36,28 +56,31 @@ STAGES = [
     ("feature_extract", "Body features", "SAM-3D-Body feature extraction"),
     ("generation", "Generation", "FlowHMR flow-matching generation"),
 ]
-STAGE_INDEX = {name: i for i, (name, _, _) in enumerate(STAGES)}
-REQUIRED_FILES = [
-    "ckpts/yolox/yolox_l.pth",
-    "ckpts/sam-3d-body-dinov3/model.ckpt",
-    "ckpts/sam-3d-body-dinov3/assets/mhr_model.pt",
-    "assets/body_models/smplh/neutral/model.npz",
-    "assets/body_models/smpl_neutral_J_regressor.pt",
-]
+HAMER_STAGE = ("hamer", "Hand refinement", "HaMeR 手指精修")
+ALL_STAGES = (*STAGES, HAMER_STAGE)
+STAGE_INDEX = {name: i for i, (name, _, _) in enumerate(ALL_STAGES)}
 SUB = "input"  # every job stores its upload as input.<ext>, so intermediates live in <job>/input/
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
+MODEL_DOWNLOADS = ModelDownloads(app.logger)
+RUNTIME.logger = app.logger
+RUNTIME_SWITCH_LOCK = threading.Lock()
 
 ENGINE = None
+INSPECTION = None
 ARGS = None
 JOBS = {}
+MEMBER_DIRS = {}
 JOBS_LOCK = threading.Lock()
+FBX_EXPORT_LOCK = threading.Lock()
+BODY_PREVIEW_LOCK = threading.Lock()
 JOB_QUEUE = queue.Queue()
 _POSTPROCESS = None
-SELECTIONS = {}           # job_id -> {"event": Event, "choice": int | None}
+SELECTIONS = {}           # job_id -> {"event": Event, "people": list[int] | None}
 CANCEL_REQUESTS = set()
 SELECT_TIMEOUT_S = 600    # a job waiting for a person pick falls back to the default after this
+ACTIVE_STATUSES = {"queued", "running", "waiting_user", "cancel_requested", "uploading"}
 
 
 class JobCancelled(Exception):
@@ -65,38 +88,63 @@ class JobCancelled(Exception):
 
 
 # --------------------------------------------------------------------------- engine
+def checked_model_paths(args):
+    paths = core_model_paths(args.ckpt, args.model_cfg)
+    missing = missing_model_paths(paths)
+    if missing:
+        raise FileNotFoundError("缺少推理模型或配置。请在右上角「模型」查看：\n  " + "\n  ".join(missing))
+    return paths
+
+
 def load_engine(args):
-    """Load shared models; VGGT is loaded by the first dynamic-camera job."""
+    """Validate and load the models from the job worker, never from startup or HTTP."""
+    paths = checked_model_paths(args)
+    ckpt, model_cfg = paths[:2]
+
+    import torch
     from flowhmr.pipeline.v2m_inference import V2MInferenceEngine
 
-    model_cfg = args.model_cfg
-    if model_cfg is None:
-        sibling = os.path.join(os.path.dirname(os.path.abspath(args.ckpt)), "config.yml")
-        model_cfg = sibling if os.path.exists(sibling) else os.path.join(
-            REPO_ROOT, "configs", "base", "model_basic05B.yml")
-
-    engine = V2MInferenceEngine.build(
-        ckpt=args.ckpt, model_cfg_path=model_cfg, device=args.device,
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device.index if device.index is not None else 0)
+    return V2MInferenceEngine.build(
+        ckpt=str(ckpt), model_cfg_path=str(model_cfg), device=args.device,
     )
-    return engine
 
 
-def get_postprocess():
+def get_engine(job_id):
+    global ENGINE
+    if ENGINE is None:
+        _raise_if_cancelled(job_id)
+        engine = load_engine(ARGS)
+        with JOBS_LOCK:
+            if job_id in CANCEL_REQUESTS:
+                raise JobCancelled()
+            ENGINE = engine
+            JOBS[job_id].update(loading_models=False, message="Starting")
+            _persist_job_locked(JOBS[job_id])
+    return ENGINE
+
+
+def get_postprocess(floor, preset, *, sole_fit_strength=0.0):
     """Post-processing pipeline, built on first use (only needed when a job asks for it)."""
     global _POSTPROCESS
     if _POSTPROCESS is None:
         from flowhmr.utils.runtime_v2m_postprocess_simple import PostprocessPipeline
         _POSTPROCESS = PostprocessPipeline.default(body_model=ENGINE.body_model,
                                                    smpl_mesh=ENGINE.smpl_mesh)
+    _POSTPROCESS.configure(floor, preset=preset, sole_fit_strength=sole_fit_strength)
     return _POSTPROCESS
 
 
 # --------------------------------------------------------------------------- parameters
 # Defaults for the page's Settings card; everything is editable per run in the UI.
 DEFAULT_PARAMS = {
-    "seed": 0, "cfg_scale": 1.0, "steps": 20, "max_frames": 900, "vggt_interval": 1,
-    "sam_chunk_size": 16,
-    "postprocess": False, "manual_select": True, "auto_frames": False, "static_camera": False,
+    "seed": 0, "cfg_scale": 1.0, "steps": 20, "max_frames": None, "vggt_interval": 0,
+    "sam_chunk_size": None, "start_frame": 0, "end_frame": None,
+    "postprocess": False, "manual_select": True, "auto_frames": True, "static_camera": False,
+    "correction_floor_m": None, "correction_preset": "normal", "sole_fit": False, "sole_fit_strength": 0.0,
+    "smoothing_frames": 0.0, "hamer": False, "hamer_stride": 1,
 }
 
 
@@ -112,8 +160,23 @@ def _to_bool(value, default):
     return str(value).strip().lower() in ("1", "true", "on", "yes")
 
 
+def _read_sole_fit_strength(settings):
+    raw = settings.get("sole_fit_strength")
+    if raw is None:
+        return SOLE_FIT_REFERENCE_STRENGTH if _to_bool(settings.get("sole_fit"), False) else 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("脚掌贴地强度须为 0 到 1 的数字。") from None
+    if isinstance(raw, bool) or not 0.0 <= value <= 1.0:
+        raise ValueError("脚掌贴地强度须为 0 到 1 的数字。")
+    return value
+
+
 def parse_params(src, base=None):
     """Validate per-job parameters from a form / JSON body; missing keys fall back to `base`."""
+    fit_settings = src if "sole_fit_strength" in src or "sole_fit" in src else (base or {})
+    sole_fit_strength = _read_sole_fit_strength(fit_settings)
     base = {**default_params(), **(base or {})}
 
     def number(key, cast, lo, hi):
@@ -128,24 +191,61 @@ def parse_params(src, base=None):
             raise ValueError(f"{key} must be between {lo} and {hi}")
         return value
 
-    def positive_integer(key):
-        raw = src.get(key)
-        if raw is None or raw == "":
-            raw = base[key]
+    def integer(key, minimum, *, optional=False):
+        raw = src.get(key, base[key])
+        if optional and raw in (None, "", "auto", "null"):
+            return None
         value = int(raw.strip()) if isinstance(raw, str) and raw.strip().isdecimal() else raw
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError(f"{key} must be a positive integer")
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{key} must be an integer >= {minimum}")
         return value
+
+    start = integer("start_frame", 0)
+    end = integer("end_frame", 0, optional=True)
+    if end is not None and end < start:
+        raise ValueError("结束帧不能早于起始帧。")
+    hamer_stride = integer("hamer_stride", 1)
+    if hamer_stride not in HAMER_STRIDES:
+        raise ValueError("HaMeR 采样间隔须为 1、2、3 或 4 帧。")
+    try:
+        smoothing = float(src.get("smoothing_frames", base["smoothing_frames"]))
+    except (TypeError, ValueError):
+        raise ValueError("平滑强度须为大于或等于 0 的数字。") from None
+    if not math.isfinite(smoothing) or smoothing < 0:
+        raise ValueError("平滑强度须为大于或等于 0 的有限值。")
+
+    floor = src.get("correction_floor_m", base["correction_floor_m"])
+    if floor in (None, "", "null", "auto"):
+        floor = None
+    else:
+        try:
+            floor = float(floor)
+        except (ValueError, TypeError):
+            raise ValueError("修正地面高度须为有效数字（米）。") from None
+        if not math.isfinite(floor):
+            raise ValueError("修正地面高度须为有限值。")
+
+    preset = src.get("correction_preset", base["correction_preset"])
+    if preset not in ("normal", "strong"):
+        raise ValueError("脚步锁定须选择标准或加强。")
 
     return {
         "seed": number("seed", int, 0, 2 ** 31 - 1),
         "cfg_scale": number("cfg_scale", float, 0.0, 10.0),
         "steps": number("steps", int, 1, 100),
-        "max_frames": number("max_frames", int, 30, 10000),
+        "max_frames": integer("max_frames", 1, optional=True),  # legacy prefix limit
         "auto_frames": _to_bool(src.get("auto_frames"), base["auto_frames"]),
-        "vggt_interval": number("vggt_interval", int, 1, 120),
-        "sam_chunk_size": positive_integer("sam_chunk_size"),
+        "start_frame": start, "end_frame": end,
+        "smoothing_frames": smoothing,
+        "hamer": _to_bool(src.get("hamer"), base["hamer"]),
+        "hamer_stride": hamer_stride,
+        "vggt_interval": number("vggt_interval", int, 0, 120),
+        "sam_chunk_size": integer("sam_chunk_size", 1, optional=True),
         "postprocess": _to_bool(src.get("postprocess"), base["postprocess"]),
+        "correction_floor_m": floor,
+        "correction_preset": preset,
+        "sole_fit": sole_fit_strength > 0,
+        "sole_fit_strength": sole_fit_strength,
         "manual_select": _to_bool(src.get("manual_select"), base.get("manual_select", True)),
         "static_camera": _to_bool(src.get("static_camera"), base["static_camera"]),
     }
@@ -153,11 +253,25 @@ def parse_params(src, base=None):
 
 # --------------------------------------------------------------------------- jobs
 def job_dir(job_id):
-    return os.path.join(ARGS.work_dir, job_id)
+    return MEMBER_DIRS.get(job_id, os.path.join(ARGS.work_dir, job_id))
 
 
-def _persist_job_locked(job):
-    path = os.path.join(job_dir(job["id"]), "job.json")
+def camera_summary(directory, params):
+    if params.get("static_camera"):
+        return {"mode": "static"}
+    path = os.path.join(directory, SUB, f"{SUB}_vggt_camera.npz")
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            return {"mode": "manual" if params.get("vggt_interval") else "auto",
+                    "interval": int(data["camera_sampling_interval"]),
+                    "samples": int(data["camera_sample_indices"].size),
+                    "frames": len(data["K"])}
+    except (OSError, ValueError, KeyError, BadZipFile):
+        return None
+
+
+def _write_job(job, directory):
+    path = os.path.join(directory, "job.json")
     temp = path + ".tmp"
     saved = dict(job)
     if job.get("status") != "waiting_user":
@@ -167,6 +281,10 @@ def _persist_job_locked(job):
         f.flush()
         os.fsync(f.fileno())
     os.replace(temp, path)
+
+
+def _persist_job_locked(job):
+    _write_job(job, job_dir(job["id"]))
 
 
 def _legacy_job(job_id, directory):
@@ -214,9 +332,20 @@ def _legacy_job(job_id, directory):
 
 def restore_jobs():
     """Restore persisted jobs and migrate older run folders into the history."""
-    for entry in os.scandir(ARGS.work_dir):
-        if not entry.is_dir() or not re.fullmatch(r"\d{8}_\d{6}_[a-f0-9]{6}", entry.name):
-            continue
+    def job_folders(directory):
+        with os.scandir(directory) as entries:
+            return [e for e in entries if e.is_dir(follow_symlinks=False)
+                    and re.fullmatch(r"\d{8}_\d{6}_[a-f0-9]{6}", e.name)]
+
+    roots = job_folders(ARGS.work_dir)
+    folders = list(roots)
+    for root in roots:
+        nested = os.path.join(root.path, "members")
+        if os.path.isdir(nested) and not os.path.islink(nested):
+            for entry in job_folders(nested):
+                MEMBER_DIRS[entry.name] = entry.path
+                folders.append(entry)
+    for entry in folders:
         path = os.path.join(entry.path, "job.json")
         try:
             with open(path, encoding="utf-8") as f:
@@ -240,7 +369,7 @@ def restore_jobs():
                        message="Run stopped when FlowHMR restarted." if cancelled
                        else "Run interrupted when FlowHMR restarted.",
                        error=None if cancelled else "The server restarted before this run finished.",
-                       finished=interrupted_at)
+                       finished=interrupted_at, loading_models=False)
             for stage in job.get("stages", []):
                 if stage.get("status") in ("running", "waiting_user"):
                     paused_at = stage.pop("paused_at", None)
@@ -249,14 +378,37 @@ def restore_jobs():
                             0.0, interrupted_at - paused_at,
                         )
                     stage.update(status="cancelled" if cancelled else "failed", end=interrupted_at)
-        job["params"] = {**default_params(), **job.get("params", {})}
+        saved_params = job.get("params", {})
+        try:
+            strength = _read_sole_fit_strength(saved_params)
+        except ValueError:
+            strength = 0.0
+        job["params"] = {**DEFAULT_PARAMS, **saved_params, "sole_fit": strength > 0, "sole_fit_strength": strength}
         job.setdefault("stages", [])
+        report = job.get("hamer_report")
+        if report and not any(stage["name"] == "hamer" for stage in job["stages"]):
+            name, label, detail = HAMER_STAGE
+            job["stages"].append({"name": name, "label": label, "detail": detail, "status": "completed",
+                                  "progress": 100, "start": None, "end": None, "elapsed_seconds": report.get("seconds")})
+        if job["status"] == "done" and "camera" not in job:
+            job["camera"] = camera_summary(entry.path, job["params"])
+        if job.get("person_batch") == job["id"]:
+            manifest = Path(entry.path) / "scene" / "scene.json"
+            try:
+                scene = json.loads(manifest.read_text(encoding="utf-8"))
+                if not (manifest.parent / "motion.npz").is_file() or not scene["people"]:
+                    raise ValueError("Incomplete scene")
+                job.update(scene=scene, scene_state="ready", scene_error=None)
+            except (OSError, ValueError, KeyError, TypeError):
+                job.pop("scene", None)
+                if job.get("scene_state") in ACTIVE_STATUSES or job.get("scene_state") == "ready":
+                    job["scene_state"] = "pending"
         with JOBS_LOCK:
             JOBS[job["id"]] = job
             _persist_job_locked(job)
 
 
-def new_job(filename, params, ext):
+def _build_job(filename, params, ext):
     job_id = time.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
     job = {
         "id": job_id, "filename": filename, "params": params, "ext": ext, "recovered": False,
@@ -265,15 +417,20 @@ def new_job(filename, params, ext):
         "num_frames": None, "fps": 30, "has_fbx": False,
         "candidates": None, "default_person": None, "selected_person": None, "selection_auto": False,
         "stages": [{"name": n, "label": l, "detail": d, "status": "pending", "progress": 0,
-                    "start": None, "end": None} for n, l, d in STAGES],
+                    "start": None, "end": None} for n, l, d in (ALL_STAGES if params.get("hamer") else STAGES)],
     }
     if params.get("static_camera", False):
         job["stages"][STAGE_INDEX["camera"]].update(
             label="Static camera", detail="Camera estimation skipped; fixed camera pose",
         )
-    os.makedirs(job_dir(job_id), exist_ok=True)
+    return job
+
+
+def new_job(filename, params, ext):
+    job = _build_job(filename, params, ext)
+    os.makedirs(job_dir(job["id"]), exist_ok=True)
     with JOBS_LOCK:
-        JOBS[job_id] = job
+        JOBS[job["id"]] = job
         _persist_job_locked(job)
     return job
 
@@ -293,10 +450,14 @@ def enqueue(job):
 
 
 def worker_loop():
-    if ARGS.device.startswith("cuda:"):
-        torch.cuda.set_device(ARGS.device)  # per-thread; YOLOX builds its grids on the current device
     while True:
         job_id = JOB_QUEUE.get()
+        if isinstance(job_id, tuple):
+            try:
+                _assemble_scene(job_id[1], automatic=False)
+            finally:
+                JOB_QUEUE.task_done()
+            continue
         try:
             run_job(job_id)
         except JobCancelled:
@@ -306,7 +467,7 @@ def worker_loop():
                     for stage in job["stages"]:
                         if stage["status"] == "running":
                             stage["status"] = "cancelled"
-                    job.update(status="cancelled", message="Stopped by user", finished=time.time())
+                    job.update(status="cancelled", message="Stopped by user", loading_models=False, finished=time.time())
                     _persist_job_locked(job)
         except Exception as e:
             with JOBS_LOCK:
@@ -319,15 +480,24 @@ def worker_loop():
                         s["status"] = "cancelled" if cancelled else "failed"
                 job.update(status="cancelled" if cancelled else "failed",
                            error=None if cancelled else f"{type(e).__name__}: {e}",
-                           message="Stopped by user" if cancelled else "Failed", finished=time.time())
+                           message="Stopped by user" if cancelled else "Failed", loading_models=False, finished=time.time())
                 _persist_job_locked(job)
             if not cancelled:
                 traceback.print_exc()
         finally:
             with JOBS_LOCK:
                 CANCEL_REQUESTS.discard(job_id)
-            torch.cuda.empty_cache()
-            JOB_QUEUE.task_done()
+                batch = JOBS.get(job_id, {}).get("person_batch")
+            try:
+                cuda = getattr(sys.modules.get("torch"), "cuda", None)
+                if getattr(cuda, "is_initialized", lambda: False)():
+                    cuda.empty_cache()
+                if batch:
+                    _assemble_scene(batch, automatic=True)
+            except RuntimeError:
+                traceback.print_exc()
+            finally:
+                JOB_QUEUE.task_done()
 
 
 def _raise_if_cancelled(job_id):
@@ -336,12 +506,201 @@ def _raise_if_cancelled(job_id):
             raise JobCancelled()
 
 
+def _link_video(source, target):
+    # Source and transcoded videos are immutable. Only link videos, never per-person caches.
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def _copy_person_thumbnail(directory, destination, person):
+    name = f"{person}.jpg"
+    source = os.path.join(directory, "persons", name)
+    if os.path.isfile(source):
+        os.makedirs(os.path.join(destination, "persons"), exist_ok=True)
+        shutil.copy2(source, os.path.join(destination, "persons", name))
+
+
+def _selected_track(candidate, *, automatic=False):
+    return {"selected_person": candidate["index"], "selection_auto": automatic,
+            "person_track": {key: candidate[key] for key in ("track_id", "num_frames", "start", "end")}}
+
+
+def _confirm_people(job_id, result, candidates, people, *, automatic):
+    """Keep the first track in this job and queue a separate job for each other track."""
+    first, *remaining = people
+    changes = dict(status="running", candidates=None, **_selected_track(candidates[first], automatic=automatic),
+                   message="No selection - using default person" if automatic
+                   else f"已选择 {len(people)} 人" if remaining else f"已选择人物 {first + 1}")
+    if not remaining:
+        with JOBS_LOCK:
+            if job_id in CANCEL_REQUESTS:
+                raise JobCancelled()
+            JOBS[job_id].update(changes)
+            _persist_job_locked(JOBS[job_id])
+        return
+
+    from flowhmr.utils.runtime_video_processing import VideoProcessor
+
+    with JOBS_LOCK:
+        parent = JOBS[job_id]
+        filename, params, ext = parent["filename"], parent["params"], parent["ext"]
+    directory = job_dir(job_id)
+    video = f"{SUB}{ext}"
+    canonical = os.path.join(SUB, f"{SUB}_30fps.mp4")
+    changes["person_batch"] = job_id
+    children = []
+    # Prepare complete jobs outside the live queue so a polling client cannot see half a job.
+    with tempfile.TemporaryDirectory(prefix=".person-batch-", dir=directory) as staging:
+        for i in remaining:
+            _raise_if_cancelled(job_id)
+            candidate = candidates[i]
+            child = _build_job(filename, params.copy(), ext)
+            child.update(_selected_track(candidate), person_batch=job_id,
+                         video_size=[result.width, result.height], source_frames=result.total_frames)
+            child_stage = os.path.join(staging, child["id"])
+            sub_dir = os.path.join(child_stage, SUB)
+            os.makedirs(sub_dir)
+            _link_video(os.path.join(directory, video), os.path.join(child_stage, video))
+            _link_video(os.path.join(directory, canonical), os.path.join(child_stage, canonical))
+            _copy_person_thumbnail(directory, child_stage, i)
+            bbox, start_end = VideoProcessor.track_bboxes(result, candidate["track_index"])
+            np.savez(os.path.join(sub_dir, f"{SUB}_bbox.npz"), bbox=bbox, start_end=start_end)
+            _write_job(child, child_stage)
+            children.append((child, child_stage))
+
+        with JOBS_LOCK:
+            if job_id in CANCEL_REQUESTS:
+                raise JobCancelled()
+            moved = []
+            try:
+                members_dir = os.path.join(directory, "members")
+                os.makedirs(members_dir, exist_ok=True)
+                for child, source in children:
+                    dest = Path(members_dir, child["id"]).resolve()
+                    if Path(ARGS.work_dir).resolve() not in dest.parents or os.path.lexists(dest):
+                        raise FileExistsError(f"Cannot publish person job {child['id']}")
+                    os.rename(source, dest)
+                    moved.append((source, dest))
+                updated = {**JOBS[job_id], **changes}
+                _persist_job_locked(updated)
+            except OSError:
+                for source, dest in reversed(moved):
+                    os.rename(dest, source)
+                raise
+            JOBS[job_id] = updated
+            for (child, _), (_, dest) in zip(children, moved):
+                MEMBER_DIRS[child["id"]] = os.fspath(dest)
+                JOBS[child["id"]] = child
+                enqueue(child)
+
+
+def _batch_members_locked(batch):
+    primary = JOBS.get(batch)
+    if primary is None or primary.get("person_batch") != batch:
+        return []
+    return [primary, *(j for j in JOBS.values() if j["id"] != batch and j.get("person_batch") == batch)]
+
+
+def _scene_status_locked(parent, members):
+    """Present a batch as one task while keeping the individual artifacts addressable."""
+    active = [j for j in members if j["status"] in ACTIVE_STATUSES]
+    completed = [j for j in members if j["status"] == "done"]
+    view = {**parent, "selected_person": None, "candidates": None,
+            "person_count": len(members), "person_done": len(completed),
+            "has_fbx": False}
+    if active:
+        order = ("waiting_user", "running", "cancel_requested", "queued", "uploading")
+        current = min(active, key=lambda j: (order.index(j["status"]), j["created"]))
+        view.update({k: current.get(k) for k in ("status", "message", "stages", "loading_models", "sam_batch",
+                                                 "hamer_report", "camera", "correction")})
+        if current.get("selected_person") is not None:
+            view["current_person"] = current["selected_person"] + 1
+        view["progress"] = int(sum(j["progress"] for j in members) * .95 / len(members))
+        view["finished"] = None
+    elif parent.get("scene") and parent.get("scene_state") == "ready":
+        scene = parent["scene"]
+        view.update(status="done", progress=100, has_fbx=fbx_export_available(),
+                    num_frames=scene["num_frames"], track_range=[scene["track_start"], scene["track_end"]],
+                    error=None, finished=parent.get("scene_finished") or max(j["finished"] or 0 for j in members))
+    elif parent.get("scene_state") in ("queued", "running", "cancel_requested"):
+        status = parent["scene_state"]
+        view.update(status=status, progress=95, error=None, finished=None,
+                    message=parent.get("scene_message", "正在对齐多人站位…"),
+                    stages=[dict(name="scene", label="场景对齐", status="running" if status == "running" else "pending",
+                                 progress=50 if status == "running" else 0, start=parent.get("scene_started"), end=None)])
+    elif completed:
+        error = parent.get("scene_error")
+        view.update(status="needs_alignment", progress=95, error=error, scene_needs_build=True,
+                    message=error or "动作已生成，可按原片对齐多人场景。")
+    else:
+        failures = [j for j in members if j["status"] == "failed"]
+        view.update(status="failed" if failures else "cancelled", error=failures[0].get("error") if failures else None)
+    return view
+
+
+def _assemble_scene(batch, *, automatic):
+    with JOBS_LOCK:
+        members = _batch_members_locked(batch)
+        if len(members) < 2 or any(j["status"] in ACTIVE_STATUSES for j in members):
+            return
+        parent = members[0]
+        state = parent.get("scene_state")
+        if (automatic and state not in (None, "pending")) or (not automatic and state != "queued"):
+            return
+        done = [(j.copy(), job_dir(j["id"])) for j in members if j["status"] == "done"]
+        if not done:
+            return
+        parent.update(scene_state="running", scene_message="正在对齐多人站位…", scene_started=time.time(), scene_error=None)
+        _persist_job_locked(parent)
+
+    def check():
+        with JOBS_LOCK:
+            if JOBS[batch].get("scene_state") == "cancel_requested":
+                raise JobCancelled()
+
+    def notify(message):
+        check()
+        update_job(batch, scene_message=message)
+
+    own_extractor = None
+    try:
+        from flowhmr.utils.runtime_group_scene import build_group_scene
+
+        if ENGINE is None:
+            from flowhmr.utils.runtime_sam_features import build_sam3d_extractor
+            import torch
+
+            notify("正在加载站位估计模型…")
+            own_extractor = build_sam3d_extractor(torch.device(ARGS.device))
+        extractor = ENGINE.sam_extractor if ENGINE is not None else own_extractor
+        scene = build_group_scene(Path(job_dir(batch)) / "scene", done, INSPECTION, extractor, ARGS.device,
+                                  check=check, notify=notify)
+        update_job(batch, scene=scene, scene_state="ready", scene_error=None, scene_finished=time.time())
+        print(f"  [scene] {batch}: {len(scene['people'])} aligned people, source frames {scene['track_start'] + 1}–{scene['track_end'] + 1}", flush=True)
+    except JobCancelled:
+        update_job(batch, scene_state="cancelled")
+    except Exception as exc:
+        update_job(batch, scene_state="failed", scene_error=f"多人场景对齐失败：{exc}")
+        traceback.print_exc()
+    finally:
+        if own_extractor is not None:
+            own_extractor.close()
+
+
 def run_job(job_id):
     _raise_if_cancelled(job_id)
+    if ENGINE is not None:
+        checked_model_paths(ARGS)
     with JOBS_LOCK:
         job = JOBS[job_id]
         params = job["params"]
-        job.update(status="running", message="Starting", started=time.time())
+        if params["hamer"] and not hamer_available(ARGS.device):
+            raise RuntimeError(MISSING_HAMER)
+        loading_models = ENGINE is None
+        job.update(status="running", loading_models=loading_models, started=time.time(),
+                   message="首次运行，正在加载推理模型…" if loading_models else "Starting")
         _persist_job_locked(job)
 
     def on_progress(stage, progress, desc):
@@ -353,6 +712,8 @@ def run_job(job_id):
             if job_id in CANCEL_REQUESTS:
                 raise JobCancelled()
             job = JOBS[job_id]
+            if idx >= len(job["stages"]):
+                return
             before = (job["progress"], job["stages"][idx]["progress"], job["stages"][idx]["status"])
             for s in job["stages"][:idx]:  # earlier stages are finished once a later one reports
                 if s["status"] != "completed":
@@ -371,13 +732,15 @@ def run_job(job_id):
                 _persist_job_locked(job)
 
     def select_person(result, candidates, default_idx):
-        """Pause the job until the user picks a person in the page (or the wait times out)."""
-        slot = {"event": threading.Event(), "choice": None}
+        """Pause for one or more choices; continue this single-person pipeline on the first."""
+        slot = {"event": threading.Event(), "people": None}
         try:
             save_person_thumbnails(job_id, candidates)
         except Exception:  # thumbnails are only a UI aid
             traceback.print_exc()
         with JOBS_LOCK:
+            if job_id in CANCEL_REQUESTS:
+                raise JobCancelled()
             SELECTIONS[job_id] = slot
             job = JOBS[job_id]
             job["stages"][STAGE_INDEX["detection"]].update(
@@ -385,57 +748,64 @@ def run_job(job_id):
             )
             job.update(status="waiting_user", candidates=candidates, default_person=default_idx,
                        video_size=[result.width, result.height],
-                       message=f"{len(candidates)} people detected - pick the person to reconstruct")
+                       message=f"检测到 {len(candidates)} 人，请勾选要生成的人物")
             _persist_job_locked(job)
         try:
-            picked = slot["event"].wait(SELECT_TIMEOUT_S)
+            slot["event"].wait(SELECT_TIMEOUT_S)
         finally:
             with JOBS_LOCK:
+                people = slot["people"]
                 stage = JOBS[job_id]["stages"][STAGE_INDEX["detection"]]
                 stage["paused_seconds"] = stage.get("paused_seconds", 0.0) + max(
                     0.0, time.time() - stage.pop("paused_at"),
                 )
                 stage["status"] = "running"
                 SELECTIONS.pop(job_id, None)
-        choice = slot["choice"] if picked and slot["choice"] is not None else default_idx
-        with JOBS_LOCK:
-            if job_id in CANCEL_REQUESTS:
-                JOBS[job_id]["stages"][STAGE_INDEX["detection"]]["end"] = time.time()
-                raise JobCancelled()
-            job = JOBS[job_id]
-            job.update(status="running", selected_person=choice, selection_auto=not picked,
-                       message=f"Person #{choice} selected" if picked else "No selection - using default person")
-            _persist_job_locked(job)
-        return choice
+        chosen = people or [default_idx]
+        _confirm_people(job_id, result, candidates, chosen, automatic=people is None)
+        return chosen[0]
 
-    ENGINE.pipeline.validation_steps = params["steps"]
-    ENGINE.postprocess = get_postprocess() if params["postprocess"] else None
-    sub_dir = ENGINE.process_video(
+    engine = get_engine(job_id)
+    _raise_if_cancelled(job_id)
+    engine.pipeline.validation_steps = params["steps"]
+    engine.postprocess = None
+    if params["postprocess"]:
+        engine.postprocess = get_postprocess(
+            params["correction_floor_m"], params["correction_preset"], sole_fit_strength=params["sole_fit_strength"],
+        )
+    sub_dir = engine.process_video(
         input_video(job_id), job_dir(job_id), seed=params["seed"], cfg_scale=params["cfg_scale"],
         max_frames=None if params["auto_frames"] else params["max_frames"],
+        start_frame=params["start_frame"], end_frame=params["end_frame"],
+        smoothing_frames=params["smoothing_frames"],
+        hamer=params["hamer"],
+        hamer_stride=params["hamer_stride"],
         vggt_frame_interval=params["vggt_interval"],
         static_camera=params.get("static_camera", False),
         sam_chunk_size=params.get("sam_chunk_size", DEFAULT_PARAMS["sam_chunk_size"]),
         person_selector=select_person if params.get("manual_select", True) else None,
         progress_callback=on_progress,
         cancel_check=lambda: _raise_if_cancelled(job_id),
+        details_callback=lambda details: update_job(job_id, **details),
     )
     _raise_if_cancelled(job_id)
-    result = os.path.join(sub_dir, f"{SUB}_seed{params['seed']}" + ("" if params["postprocess"] else "_origin"))
+    final_suffix = "" if params["postprocess"] or params["hamer"] else "_origin"
+    result = os.path.join(sub_dir, f"{SUB}_seed{params['seed']}{final_suffix}")
     if not os.path.exists(result + ".npz"):
         raise FileNotFoundError(f"generation output missing: {result}.npz")
 
     update_job(job_id, message="Building 3D mesh")
     out_root = job_dir(job_id)
     _raise_if_cancelled(job_id)
-    meta = export_mesh_sequence(result + ".npz", os.path.join(out_root, "mesh"))
+    meta = export_mesh_sequence(result + ".npz", os.path.join(out_root, "mesh"),
+                                cancel_check=lambda: _raise_if_cancelled(job_id))
     _raise_if_cancelled(job_id)
-    start, end = 0, meta["num_frames"] - 1
+    start = 0
     bbox_npz = os.path.join(sub_dir, f"{SUB}_bbox.npz")
     if os.path.exists(bbox_npz):
-        se = np.load(bbox_npz)["start_end"]
-        start, end = int(se[0]), int(se[1])
-    meta.update({"track_start": start, "track_end": end})
+        with np.load(bbox_npz, allow_pickle=False) as bbox:
+            start = int(bbox["start_end"][0])
+    meta.update({"track_start": start, "track_end": start + meta["num_frames"] - 1})
     with open(os.path.join(out_root, "mesh", "meta.json"), "w") as f:
         json.dump(meta, f)
 
@@ -444,6 +814,16 @@ def run_job(job_id):
     if has_fbx:
         shutil.copy2(result + ".fbx", os.path.join(out_root, "motion.fbx"))
 
+    camera = camera_summary(out_root, params)
+    correction = None
+    if engine.postprocess is not None:
+        report = engine.postprocess.last_report
+        correction = {"floor_m": float(report["floor"]), "automatic": params["correction_floor_m"] is None,
+                      "preset": report["preset"],
+                      "contacts": int(report["contacts"]), "seconds": float(report["elapsed_seconds"]),
+                      "warning": report.get("warning", "")}
+        if "sole_fit" in report:
+            correction["sole_fit"] = report["sole_fit"]
     now = time.time()
     with JOBS_LOCK:
         if job_id in CANCEL_REQUESTS:
@@ -453,7 +833,7 @@ def run_job(job_id):
             if s["status"] != "completed":
                 s.update(status="completed", progress=100, end=now, start=s["start"] or now)
         job.update(status="done", progress=100, message="Done", finished=now,
-                   num_frames=meta["num_frames"], has_fbx=has_fbx)
+                   num_frames=meta["num_frames"], has_fbx=has_fbx, camera=camera, correction=correction)
         _persist_job_locked(job)
 
 
@@ -461,6 +841,7 @@ def run_job(job_id):
 def save_person_thumbnails(job_id, candidates):
     """One crop per candidate (at the frame where its box is largest), for the selection list."""
     import cv2
+    from flowhmr.utils.runtime_image_io import write_image
     video = os.path.join(job_dir(job_id), SUB, f"{SUB}_30fps.mp4")
     out_dir = os.path.join(job_dir(job_id), "persons")
     os.makedirs(out_dir, exist_ok=True)
@@ -484,18 +865,20 @@ def save_person_thumbnails(job_id, candidates):
             scale = 192.0 / crop.shape[0]
             crop = cv2.resize(crop, (max(1, int(round(crop.shape[1] * scale))), 192),
                               interpolation=cv2.INTER_AREA)
-            cv2.imwrite(os.path.join(out_dir, f"{c['index']}.jpg"), crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+            write_image(os.path.join(out_dir, f"{c['index']}.jpg"), crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
     finally:
         cap.release()
 
 
 # --------------------------------------------------------------------------- mesh export
-def export_mesh_sequence(motion_npz, out_dir):
+def export_mesh_sequence(motion_npz, out_dir, cancel_check=lambda: None):
     """Run SMPL-H forward on the generated motion and write a float16 vertex stream.
 
     No ground alignment: Y=0 is the floor and the model's root height is shown
     as-is (open post-processing in the page if feet should contact the floor).
     """
+    import torch
+
     os.makedirs(out_dir, exist_ok=True)
     data = np.load(motion_npz, allow_pickle=True)
     poses = torch.from_numpy(np.asarray(data["poses"], dtype=np.float32))
@@ -508,25 +891,34 @@ def export_mesh_sequence(motion_npz, out_dir):
     dev = mesh_model.v_template.device
     betas = betas[:, :mesh_model.shapedirs.shape[-1]].to(dev)
 
-    verts = []
-    with torch.no_grad():
-        for s in range(0, T, 64):
-            e = min(T, s + 64)
-            out = mesh_model({"poses": poses[s:e].to(dev), "shapes": betas,
-                              "trans": trans[s:e].to(dev)})
-            verts.append(out["vertices"].float().cpu())
-    verts = torch.cat(verts, 0).numpy()
     faces = np.asarray(mesh_model.faces, dtype=np.uint32)
-
-    verts.astype(np.float16).tofile(os.path.join(out_dir, "vertices.bin"))
+    minimum = np.full(3, np.inf, np.float32)
+    maximum = np.full(3, -np.inf, np.float32)
+    temporary = os.path.join(out_dir, "vertices.bin.part")
+    try:
+        with torch.no_grad(), open(temporary, "wb") as stream:
+            for s in range(0, T, 64):
+                cancel_check()
+                e = min(T, s + 64)
+                out = mesh_model({"poses": poses[s:e].to(dev), "shapes": betas,
+                                  "trans": trans[s:e].to(dev)})
+                verts = out["vertices"].float().cpu().numpy()
+                flat = verts.reshape(-1, 3)
+                np.minimum(minimum, flat.min(0), out=minimum)
+                np.maximum(maximum, flat.max(0), out=maximum)
+                verts.astype(np.float16).tofile(stream)
+        cancel_check()
+        os.replace(temporary, os.path.join(out_dir, "vertices.bin"))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     faces.tofile(os.path.join(out_dir, "faces.bin"))
 
     root = trans.numpy().copy()
     return {
-        "num_frames": int(T), "num_vertices": int(verts.shape[1]), "num_faces": int(faces.shape[0]),
+        "num_frames": int(T), "num_vertices": int(mesh_model.v_template.shape[-2]), "num_faces": int(faces.shape[0]),
         "fps": 30, "vertex_dtype": "float16", "face_dtype": "uint32", "up_axis": "y",
-        "bbox_min": verts.reshape(-1, 3).min(0).tolist(),
-        "bbox_max": verts.reshape(-1, 3).max(0).tolist(),
+        "bbox_min": minimum.tolist(), "bbox_max": maximum.tolist(),
         "root_trajectory": root[:, [0, 2]].round(4).tolist(),
     }
 
@@ -550,18 +942,137 @@ def static_files(path):
     return send_from_directory(os.path.join(WEB_DIR, "static"), path)
 
 
+def local_model_request():
+    try:
+        hostname = urlsplit("//" + request.host).hostname
+    except ValueError:
+        return False
+    if request.remote_addr not in ("127.0.0.1", "::1") or hostname not in ("localhost", "127.0.0.1", "::1"):
+        return False
+    origin = request.headers.get("Origin")
+    return origin is None or origin == request.host_url.rstrip("/")
+
+
 @app.route("/api/info")
 def api_info():
+    config = getattr(ARGS, "model_cfg", None)
+    inventory = model_inventory(ARGS.device, ARGS.ckpt, config)
+    if local_model_request():
+        plan = missing_downloads(ARGS.device, ARGS.ckpt, config)
+        inventory["downloadable"] = list(plan)
+        inventory["download_bytes"] = sum(asset.size for assets in plan.values() for asset in assets)
+        inventory["download"] = MODEL_DOWNLOADS.snapshot()
     return jsonify({
-        "model": os.path.basename(ARGS.ckpt), "device": str(ENGINE.device),
-        "steps": DEFAULT_PARAMS["steps"], "max_frames": DEFAULT_PARAMS["max_frames"],
+        "model": flowhmr_paths(ARGS.ckpt, config)[0].name, "device": ARGS.device,
+        "models_loaded": ENGINE is not None,
+        "model_files": inventory,
+        "runtime": RUNTIME.summary(),
+        "steps": DEFAULT_PARAMS["steps"],
         "fps": 30, "defaults": default_params(),
-        "stages": [{"name": n, "label": l, "detail": d} for n, l, d in STAGES],
+        "stages": [{"name": n, "label": l, "detail": d} for n, l, d in ALL_STAGES],
         "max_upload_mb": app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
+        "postprocess_available": native_correction_available(),
+        "hamer_available": any(item["id"] == "hamer" and item["status"] == "ready" for item in inventory["items"]),
+        "body_variants": available_variants(),
+        "motion_frame_capacity": MAX_MOTION_FRAMES,
+        "sam_manual_default": getattr(ARGS, "sam_chunk_default", 16),
     })
 
 
+@app.get("/api/runtime")
+def api_runtime():
+    if not local_model_request():
+        return jsonify(error="请在本机 FlowHMR 窗口管理运行环境。"), 403
+    return jsonify(RUNTIME.details())
+
+
+@app.post("/api/runtime/download")
+def api_runtime_download():
+    if not local_model_request():
+        return jsonify(error="请在本机 FlowHMR 窗口管理运行环境。"), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("version"), str):
+        return jsonify(error="请选择运行环境版本。"), 400
+    with RUNTIME_SWITCH_LOCK:
+        if RUNTIME.summary()["pending_restart"]:
+            return jsonify(error="请先重启运行环境，完成切换。"), 409
+        try:
+            return jsonify(RUNTIME.start(data["version"]))
+        except DownloadError as error:
+            return jsonify(error=str(error)), 400
+
+
+@app.post("/api/runtime/download/stop")
+def api_runtime_download_stop():
+    if not local_model_request():
+        return jsonify(error="请在本机 FlowHMR 窗口管理运行环境。"), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+        return jsonify(error="无效的下载任务。"), 400
+    return jsonify(RUNTIME.stop(data["id"]))
+
+
+@app.post("/api/runtime/select")
+def api_runtime_select():
+    if not local_model_request():
+        return jsonify(error="请在本机 FlowHMR 窗口管理运行环境。"), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("version"), str):
+        return jsonify(error="请选择运行环境版本。"), 400
+    with RUNTIME_SWITCH_LOCK:
+        with JOBS_LOCK:
+            busy = any(job["status"] in ACTIVE_STATUSES for job in JOBS.values())
+        if busy or any(download.snapshot()["status"] in ACTIVE_DOWNLOAD for download in (RUNTIME, MODEL_DOWNLOADS)):
+            return jsonify(error="有生成或下载任务在运行，完成或停止后再切换。"), 409
+        try:
+            return jsonify(RUNTIME.select(data["version"]))
+        except DownloadError as error:
+            return jsonify(error=str(error)), 400
+        except OSError:
+            app.logger.exception("Could not save runtime selection")
+            return jsonify(error="无法保存运行环境选择，请检查目录写入权限。"), 500
+
+
+def requires_runtime(view):
+    @wraps(view)
+    def guarded(*args, **kwargs):
+        with RUNTIME_SWITCH_LOCK:
+            state = RUNTIME.summary()
+            if not state["ready"]:
+                message = ("请先重启运行环境，完成切换。" if state["pending_restart"] else
+                           "请在右上角「运行环境」下载并启用 CUDA 运行环境。")
+                return jsonify(error=message, code="runtime_required"), 409
+            return view(*args, **kwargs)
+    return guarded
+
+
+@app.route("/api/models/download", methods=["GET", "POST"])
+def api_model_download():
+    if not local_model_request():
+        return jsonify(error="请在本机 FlowHMR 窗口下载模型。"), 403
+    if request.method == "GET":
+        return jsonify(MODEL_DOWNLOADS.snapshot())
+    if request.get_json(silent=True) != {}:
+        return jsonify(error="无效的下载请求。"), 400
+    with RUNTIME_SWITCH_LOCK:
+        if RUNTIME.summary()["pending_restart"]:
+            return jsonify(error="请先重启运行环境，完成切换。"), 409
+        config = getattr(ARGS, "model_cfg", None)
+        return jsonify(MODEL_DOWNLOADS.start(missing_downloads(ARGS.device, ARGS.ckpt, config)))
+
+
+@app.route("/api/models/download/stop", methods=["POST"])
+def api_stop_model_download():
+    if not local_model_request():
+        return jsonify(error="请在本机 FlowHMR 窗口操作。"), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+        return jsonify(error="无效的下载任务。"), 400
+    return jsonify(MODEL_DOWNLOADS.stop(data["id"]))
+
+
 @app.route("/api/upload", methods=["POST"])
+@requires_runtime
 def api_upload():
     f = request.files.get("video")
     if f is None or not f.filename:
@@ -580,18 +1091,30 @@ def api_upload():
 
 
 @app.route("/api/jobs/<job_id>/rerun", methods=["POST"])
+@requires_runtime
 def api_rerun(job_id):
     """New job on the same video; reuse caches compatible with its camera and range."""
-    src = get_job(job_id)
-    if src["status"] in ("queued", "running", "waiting_user", "cancel_requested"):
+    with JOBS_LOCK:
+        src = JOBS.get(job_id)
+        if src is None:
+            abort(404)
+        members = _batch_members_locked(job_id)
+        is_scene = len(members) > 1
+        src = copy.deepcopy(_scene_status_locked(src, members) if is_scene else src)
+    if src["status"] in ACTIVE_STATUSES:
         return jsonify({"error": "job is still running"}), 409
     body = request.get_json(silent=True) or {}
+    if is_scene:
+        body = {**body, "manual_select": True, "reselect_person": True}
     try:
         params = parse_params(body, base=src["params"])
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     job = new_job(src["filename"], params, src["ext"])
-    shutil.copy2(input_video(job_id), input_video(job["id"]))
+    _link_video(input_video(job_id), input_video(job["id"]))
+    old_thumbnail = os.path.join(job_dir(job_id), "thumbnail.jpg")
+    if os.path.isfile(old_thumbnail):
+        shutil.copy2(old_thumbnail, os.path.join(job_dir(job["id"]), "thumbnail.jpg"))
     src_sub = os.path.join(job_dir(job_id), SUB)
     if src["status"] in ("done", "failed", "cancelled") and os.path.isdir(src_sub):
         dst_sub = os.path.join(job_dir(job["id"]), SUB)
@@ -599,9 +1122,13 @@ def api_rerun(job_id):
         skip = (f"{SUB}_seed",)  # generated motion is recomputed
         reselect = _to_bool(body.get("reselect_person"), False)
         camera_changed = params["static_camera"] != src["params"].get("static_camera", False)
-        old_limit = None if src["params"].get("auto_frames", False) else src["params"]["max_frames"]
-        new_limit = None if params["auto_frames"] else params["max_frames"]
-        range_changed = old_limit != new_limit
+        def requested_range(settings):
+            end = settings.get("end_frame")
+            if not settings.get("auto_frames", True) and settings.get("max_frames") is not None:
+                limit = settings["max_frames"] - 1
+                end = min(end, limit) if end is not None else limit
+            return settings.get("start_frame", 0), end
+        range_changed = requested_range(src["params"]) != requested_range(params)
         if reselect:
             # per-person caches are invalidated so detection runs and the user picks again
             skip += (f"{SUB}_bbox.npz",)
@@ -616,7 +1143,15 @@ def api_rerun(job_id):
         for name in os.listdir(src_sub):
             path = os.path.join(src_sub, name)
             if not name.startswith(skip) and os.path.isfile(path):
-                shutil.copy2(path, dst_sub)
+                if name == f"{SUB}_30fps.mp4":
+                    _link_video(path, os.path.join(dst_sub, name))
+                else:
+                    shutil.copy2(path, dst_sub)
+        person = src.get("selected_person")
+        if person is not None and not reselect and os.path.isfile(os.path.join(dst_sub, f"{SUB}_bbox.npz")):
+            _copy_person_thumbnail(job_dir(job_id), job_dir(job["id"]), person)
+            update_job(job["id"], selected_person=person, person_track=src.get("person_track"),
+                       selection_auto=src.get("selection_auto", False))
     enqueue(job)
     return jsonify({"job_id": job["id"]})
 
@@ -627,57 +1162,119 @@ def api_cancel_job(job_id):
         job = JOBS.get(job_id)
         if job is None:
             abort(404)
-        if job["status"] not in ("queued", "running", "waiting_user"):
+        members = _batch_members_locked(job_id)
+        if not members:
+            members = [job]
+        active = [j for j in members if j["status"] in ("queued", "running", "waiting_user")]
+        if not active and job.get("scene_state") not in ("queued", "running"):
             return jsonify({"error": "run is no longer active"}), 409
-        CANCEL_REQUESTS.add(job_id)
-        job.update(status="cancel_requested", message="Stop requested; stopping at the next safe step")
-        _persist_job_locked(job)
-        slot = SELECTIONS.get(job_id)
-        if slot is not None:
-            slot["event"].set()
+        if len(members) > 1:
+            job["scene_state"] = "cancel_requested" if job.get("scene_state") == "running" else "cancelled"
+            _persist_job_locked(job)
+        for member in active:
+            mid = member["id"]
+            CANCEL_REQUESTS.add(mid)
+            member.update(status="cancel_requested", message="Stop requested; stopping at the next safe step")
+            _persist_job_locked(member)
+            slot = SELECTIONS.get(mid)
+            if slot is not None:
+                slot["event"].set()
     return jsonify({"ok": True, "job_id": job_id})
 
 
 @app.route("/api/jobs/<job_id>/select", methods=["POST"])
 def api_select(job_id):
-    """Resume a job waiting for person selection: body {"person": <candidate index>}."""
-    get_job(job_id)
-    body = request.get_json(silent=True) or {}
+    """Resume with {"people": [candidate indices]}; older clients may send one person."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="请提交所选人物。"), 400
+    people = body.get("people", [body.get("person")])
     with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            abort(404)
         slot = SELECTIONS.get(job_id)
-        n = len(JOBS[job_id]["candidates"] or [])
-    if slot is None:
-        return jsonify({"error": "job is not waiting for a selection"}), 409
-    try:
-        person = int(body.get("person"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "person must be an integer"}), 400
-    if not 0 <= person < n:
-        return jsonify({"error": f"person must be in [0, {n - 1}]"}), 400
-    slot["choice"] = person
-    slot["event"].set()
-    return jsonify({"ok": True, "person": person})
+        if slot is None or slot["event"].is_set() or job["status"] != "waiting_user":
+            return jsonify(error="此任务已不在等待选人。"), 409
+        n = len(job["candidates"] or [])
+        if not isinstance(people, list) or not people or any(type(i) is not int or not 0 <= i < n for i in people):
+            return jsonify(error="请至少勾选一个已检测到的人物。"), 400
+        people = list(dict.fromkeys(people))
+        slot["people"] = people
+        slot["event"].set()
+    return jsonify(ok=True, person=people[0], people=people)
+
+
+@app.route("/api/jobs/<job_id>/scene", methods=["POST"])
+def api_prepare_scene(job_id):
+    with JOBS_LOCK:
+        members = _batch_members_locked(job_id)
+        if len(members) < 2:
+            return jsonify(error="此任务没有多人场景。"), 404
+        parent = members[0]
+        if not _scene_status_locked(parent, members).get("scene_needs_build"):
+            return jsonify(error="场景已存在或正在处理。"), 409
+        parent.update(scene_state="queued", scene_message="等待对齐多人站位…", scene_error=None)
+        _persist_job_locked(parent)
+        JOB_QUEUE.put(("scene", job_id))
+    return jsonify(ok=True)
 
 
 @app.route("/api/jobs/<job_id>")
 def api_job(job_id):
-    job = get_job(job_id)
+    with JOBS_LOCK:
+        row = JOBS.get(job_id)
+        if row is None:
+            abort(404)
+        members = _batch_members_locked(job_id)
+        job = copy.deepcopy(_scene_status_locked(row, members) if len(members) > 1 else row)
+    if job["status"] == "done" and not job.get("person_count"):
+        job["has_fbx"] = fbx_export_available() and os.path.isfile(os.path.join(job_dir(job_id), "motion.npz"))
+    if not job.get("source_frames") and job["status"] in ("done", "cancelled", "failed"):
+        canonical = os.path.join(job_dir(job_id), SUB, f"{SUB}_30fps.mp4")
+        if os.path.isfile(canonical):
+            import cv2
+
+            capture = cv2.VideoCapture(canonical)
+            try:
+                frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+                count = int(frames) if math.isfinite(frames) else 0
+                if count > 0:
+                    job["source_frames"] = count
+                    with JOBS_LOCK:
+                        if job_id in JOBS and not JOBS[job_id].get("source_frames"):
+                            JOBS[job_id]["source_frames"] = count
+                            _persist_job_locked(JOBS[job_id])
+            except (OSError, ValueError, cv2.error):
+                pass
+            finally:
+                capture.release()
     with JOBS_LOCK:
         job["queue_position"] = sum(1 for j in JOBS.values()
                                     if j["status"] == "queued" and j["created"] < job["created"])
     job["now"] = time.time()
+    job["models_loaded"] = ENGINE is not None
     return jsonify(job)
 
 
 @app.route("/api/jobs")
 def api_jobs():
-    keys = ("id", "filename", "status", "progress", "created", "finished", "num_frames", "params", "recovered")
+    keys = ("id", "filename", "status", "progress", "created", "finished", "num_frames", "params", "recovered",
+            "selected_person", "person_count", "person_done")
     with JOBS_LOCK:
-        jobs = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)[:20]
-        deletable_count = sum(j["status"] not in ("queued", "running", "waiting_user", "cancel_requested", "uploading")
-                              for j in JOBS.values())
+        groups = defaultdict(list)
+        for row in JOBS.values():
+            if row.get("person_batch"):
+                groups[row["person_batch"]].append(row)
+        grouped = {mid for batch, members in groups.items() if batch in JOBS and len(members) > 1
+                   for mid in (row["id"] for row in members if row["id"] != batch)}
+        ordered = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)
+        ordered = [_scene_status_locked(j, groups[j["id"]]) if len(groups.get(j["id"], ())) > 1 else j
+                   for j in ordered if j["id"] not in grouped]
+        jobs = [j for i, j in enumerate(ordered) if i < 20 or j["status"] in ACTIVE_STATUSES]
+        deletable_count = sum(j["status"] not in ACTIVE_STATUSES for j in ordered)
         return jsonify({"now": time.time(),
-                        "jobs": [{k: copy.deepcopy(j[k]) for k in keys} for j in jobs],
+                        "jobs": [{k: copy.deepcopy(j.get(k)) for k in keys} for j in jobs],
                         "deletable_count": deletable_count})
 
 
@@ -695,25 +1292,46 @@ def api_delete_jobs():
     deleted, skipped = [], []
     with JOBS_LOCK:
         job_ids = list(JOBS) if requested is None else list(dict.fromkeys(requested))
-        for job_id in job_ids:
+        visited = set()
+        for requested_id in job_ids:
+            row = JOBS.get(requested_id)
+            job_id = (row.get("person_batch") or requested_id) if row else requested_id
+            if job_id not in JOBS and row:
+                job_id = requested_id
+            if job_id in visited:
+                continue
+            visited.add(job_id)
             job = JOBS.get(job_id)
             if job is None:
                 if requested is not None:
                     skipped.append({"id": job_id, "reason": "not found"})
                 continue
-            if job["status"] in ("queued", "running", "waiting_user", "cancel_requested", "uploading"):
+            members = _batch_members_locked(job_id) or [job]
+            if any(j["status"] in ACTIVE_STATUSES for j in members) or job.get("scene_state") in ACTIVE_STATUSES:
                 skipped.append({"id": job_id, "reason": "job is still active"})
                 continue
             try:
-                shutil.rmtree(job_dir(job_id), ignore_errors=False)
+                work = Path(ARGS.work_dir).resolve()
+                root = Path(job_dir(job_id)).resolve()
+                # Older jobs have sibling folders; newer group members live inside this root.
+                paths = [Path(job_dir(member["id"])).resolve() for member in members[1:]]
+                if any(work not in path.parents for path in [root, *paths]):
+                    raise OSError("Job path is outside the FlowHMR results directory")
+                for path in [*(p for p in paths if root not in p.parents), root]:
+                    if path.is_dir():
+                        shutil.rmtree(path)
             except FileNotFoundError:
                 pass
             except OSError as e:
                 skipped.append({"id": job_id, "reason": f"could not remove files: {e}"})
                 continue
-            JOBS.pop(job_id)
-            SELECTIONS.pop(job_id, None)
-            deleted.append(job_id)
+            for member in members:
+                mid = member["id"]
+                visited.add(mid)
+                JOBS.pop(mid, None)
+                MEMBER_DIRS.pop(mid, None)
+                SELECTIONS.pop(mid, None)
+                deleted.append(mid)
     return jsonify({"deleted": deleted, "skipped": skipped})
 
 
@@ -744,8 +1362,140 @@ _RESULT_FILES = {
     "vertices": ("mesh/vertices.bin", "application/octet-stream"),
     "faces": ("mesh/faces.bin", "application/octet-stream"),
     "npz": ("motion.npz", "application/octet-stream"),
-    "fbx": ("motion.fbx", "application/octet-stream"),
 }
+
+
+def fbx_export_available():
+    return find_spec("fbx") is not None and file_present(resolve_model(SMPLH_FILES["neutral"]))
+
+
+def export_stem(job):
+    name = os.path.splitext(job["filename"])[0]
+    person = job.get("selected_person")
+    return f"{name}_person{person + 1}" if person is not None else name
+
+
+def file_stamp(path):
+    stat = os.stat(path)
+    return f"{stat.st_mtime_ns:x}_{stat.st_size:x}"
+
+
+def variant_preview(directory, body):
+    variant = model_path(body)
+    source = os.path.join(directory, "motion.npz")
+    mesh = os.path.join(directory, "mesh")
+    with open(os.path.join(mesh, "meta.json"), encoding="utf-8") as f:
+        meta = json.load(f)
+    size = int(meta["num_frames"]) * int(meta["num_vertices"]) * 6
+    neutral = model_path("neutral")
+    name = f"vertices_v1_{body}_{file_stamp(source)}_{file_stamp(neutral)}_{file_stamp(variant)}.bin"
+    output = os.path.join(mesh, name)
+    with BODY_PREVIEW_LOCK:
+        if os.path.isfile(output) and os.path.getsize(output) == size:
+            return output
+        part = output + ".part"
+        try:
+            with open(part, "wb") as f:
+                write_preview_vertices(source, variant, f)
+            if os.path.getsize(part) != size:
+                raise ValueError("体型预览的帧数与动作不一致。")
+            os.replace(part, output)
+        finally:
+            if os.path.exists(part):
+                os.unlink(part)
+    return output
+
+
+@app.route("/api/jobs/<job_id>/fbx")
+def api_fbx(job_id):
+    job = get_job(job_id)
+    directory = job_dir(job_id)
+    is_scene = job.get("person_batch") == job_id
+    source = os.path.join(directory, "scene" if is_scene else "", "motion.npz")
+    if (not job.get("scene") if is_scene else job["status"] != "done") or not os.path.isfile(source) or not fbx_export_available():
+        abort(404)
+    mode = request.args.get("mesh", "1")
+    if mode not in ("0", "1"):
+        return jsonify(error="请选择仅骨架或包含蒙皮网格。"), 400
+    with_skin = mode == "1"
+    suffix = "skin" if with_skin else "skeleton"
+    body = request.args.get("body", "neutral") if with_skin else "neutral"
+    try:
+        variant = model_path(body) if body != "neutral" else None
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    tag = f"_{body}_{file_stamp(model_path('neutral'))}_{file_stamp(variant)}" if variant else ""
+    chosen, signature = None, ""
+    if is_scene:
+        available = job["scene"]["people"]
+        numbers = {str(p["person"]) for p in available}
+        requested = set(request.args.getlist("person")) or numbers
+        if not requested <= numbers:
+            return jsonify(error="请选择此场景中的人物。"), 400
+        chosen = [p for p in available if str(p["person"]) in requested]
+        signature = hashlib.sha256(",".join(sorted(requested)).encode()).hexdigest()[:12]
+    # The final NPZ is authoritative. Re-export old jobs with the corrected
+    # rig instead of sending a legacy FBX saved before the exporter fix.
+    with FBX_EXPORT_LOCK:
+        exports = os.path.join(directory, "scene" if is_scene else "", "exports")
+        prefix = f"fbx_scene_v2_{signature}" if is_scene else "fbx_mmr_v2"
+        path = os.path.join(exports, f"{prefix}_{file_stamp(source)}_{suffix}{tag}.fbx")
+        if not os.path.isfile(path):
+            from flowhmr.core.export.smplh2fbx import SMPLH2FBX
+
+            with SMPLH2FBX() as converter:
+                if chosen is None:
+                    converter.convert_npz_to_fbx(source, path, export_mesh=with_skin, variant_path=variant)
+                else:
+                    converter.convert_scene_to_fbx(source, chosen, path, export_mesh=with_skin, variant_path=variant)
+    if variant:
+        suffix = f"{body}_{suffix}"
+    if is_scene:
+        stem = os.path.splitext(job["filename"])[0]
+        group = ("scene" if len(chosen) == len(available) else f"person{chosen[0]['person']}" if len(chosen) == 1
+                 else f"scene_{len(chosen)}people_{signature[:6]}")
+        name = f"{stem}_flowhmr_{group}_{suffix}.fbx"
+    else:
+        name = f"{export_stem(job)}_flowhmr_{suffix}.fbx"
+    return send_file(path, mimetype="application/octet-stream", as_attachment=True, download_name=name, conditional=True)
+
+
+@app.route("/api/jobs/<job_id>/thumbnail.jpg")
+def api_thumbnail(job_id):
+    job = get_job(job_id)
+    directory = job_dir(job_id)
+    person = job.get("selected_person") if job.get("person_batch") != job_id else None
+    if person is not None:
+        path = os.path.join(directory, "persons", f"{person}.jpg")
+        if os.path.isfile(path):
+            return send_file(path, mimetype="image/jpeg", conditional=True, max_age=3600)
+    thumbnail = os.path.join(directory, "thumbnail.jpg")
+    if not os.path.isfile(thumbnail):
+        canonical = os.path.join(directory, SUB, f"{SUB}_30fps.mp4")
+        video = canonical if os.path.isfile(canonical) else os.path.join(directory, f"input{job['ext']}")
+        try:
+            if not os.path.isfile(video) or not ensure_thumbnail(video, thumbnail):
+                abort(404)
+        except FileNotFoundError:
+            abort(404)
+    return send_file(thumbnail, mimetype="image/jpeg", conditional=True, max_age=3600)
+
+
+@app.route("/api/jobs/<job_id>/skeleton")
+def api_skeleton(job_id):
+    job = get_job(job_id)
+    if job["status"] != "done":
+        abort(404)
+    try:
+        path, info = INSPECTION.load(job_dir(job_id))
+    except FileNotFoundError:
+        abort(404)
+    correction = job.get("correction")
+    if correction:
+        info = {**info, "ground": {"height_m": correction["floor_m"], "source": "correction"}}
+    response = send_file(path, mimetype="application/octet-stream", conditional=True)
+    response.headers["X-FlowHMR-Inspection"] = json.dumps(info, separators=(",", ":"))
+    return response
 
 
 @app.route("/api/jobs/<job_id>/<kind>")
@@ -758,12 +1508,28 @@ def api_result(job_id, kind):
         return send_file(path, conditional=True)
     if kind not in _RESULT_FILES:
         abort(404)
+    if kind == "npz" and job.get("person_batch") == job_id:
+        if not job.get("scene"):
+            abort(404)
+        return send_file(os.path.join(job_dir(job_id), "scene", "motion.npz"),
+                         mimetype="application/octet-stream", as_attachment=True,
+                         download_name=f"{os.path.splitext(job['filename'])[0]}_flowhmr_scene.npz", conditional=True)
     rel, mime = _RESULT_FILES[kind]
     path = os.path.join(job_dir(job_id), rel)
+    body = request.args.get("body", "neutral")
+    if kind == "vertices" and body != "neutral":
+        if job["status"] != "done":
+            abort(404)
+        try:
+            path = variant_preview(job_dir(job_id), body)
+        except FileNotFoundError:
+            abort(404)
+        except (ValueError, KeyError) as exc:
+            return jsonify(error=str(exc)), 400
     if not os.path.exists(path):
         abort(404)
-    as_attachment = kind in ("npz", "fbx")
-    name = f"{os.path.splitext(job['filename'])[0]}_flowhmr.{kind}" if as_attachment else None
+    as_attachment = kind == "npz"
+    name = f"{export_stem(job)}_flowhmr.{kind}" if as_attachment else None
     return send_file(path, mimetype=mime, as_attachment=as_attachment,
                      download_name=name, conditional=True)
 
@@ -771,31 +1537,32 @@ def api_result(job_id, kind):
 # --------------------------------------------------------------------------- main
 def parse_args():
     p = argparse.ArgumentParser(prog="app.py", description="FlowHMR web demo")
-    p.add_argument("--ckpt", default=os.path.join(REPO_ROOT, "checkpoints", "flowhmr_latest",
-                                                  "flowhmr_latest.ckpt"),
-                   help="FlowHMR checkpoint (config.yml next to it)")
+    p.add_argument("--ckpt", help="FlowHMR checkpoint (default: models/flowhmr_latest/flowhmr_latest.ckpt)")
     p.add_argument("--model_cfg", default=None)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--sam-chunk-default", type=int, default=16, help="Initial value in the manual batch field")
     p.add_argument("--work_dir", default=os.path.join(REPO_ROOT, "output", "web_jobs"))
-    return p.parse_args()
+    args = p.parse_args()
+    if args.sam_chunk_default < 1:
+        p.error("--sam-chunk-default must be a positive integer")
+    return args
 
 
 def main():
-    global ENGINE, ARGS
+    global ARGS, INSPECTION
     ARGS = parse_args()
-    ARGS.ckpt = os.path.abspath(ARGS.ckpt)
-    missing = [f for f in REQUIRED_FILES if not os.path.exists(os.path.join(REPO_ROOT, f))]
+    if ARGS.ckpt:
+        ARGS.ckpt = os.path.abspath(ARGS.ckpt)
+    if ARGS.model_cfg:
+        ARGS.model_cfg = os.path.abspath(ARGS.model_cfg)
     ARGS.work_dir = os.path.abspath(ARGS.work_dir)
-    if not os.path.exists(ARGS.ckpt):
-        missing.insert(0, ARGS.ckpt)
-    if missing:
-        sys.exit("missing files (see docs/install.md):\n  " + "\n  ".join(missing))
     os.makedirs(ARGS.work_dir, exist_ok=True)
+    ensure_model_folders()
     restore_jobs()
     os.chdir(REPO_ROOT)  # body-model / asset paths are repo-relative
-    ENGINE = load_engine(ARGS)
+    INSPECTION = PreviewInspection()
     threading.Thread(target=worker_loop, daemon=True).start()
     print(f"\n  FlowHMR web demo ready:  http://{ARGS.host}:{ARGS.port}\n")
     app.run(host=ARGS.host, port=ARGS.port, threaded=True, debug=False)

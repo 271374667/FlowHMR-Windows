@@ -1,7 +1,7 @@
 """FlowHMR inference from raw videos: video -> SMPL-H motion (npz, + fbx if fbxsdkpy is installed).
 
     python run_v2m_demo_generation.py assets/example/example.mp4
-    python run_v2m_demo_generation.py a.mp4 b.mov my_videos/ --ckpt checkpoints/flowhmr_base/flowhmr_base.ckpt
+    python run_v2m_demo_generation.py a.mp4 b.mov my_videos/ --ckpt models/flowhmr_base/flowhmr_base.ckpt
 
 The default pipeline is: 30 fps transcode -> YOLOX person detection & tracking ->
 VGGT-Omega camera -> SAM-3D-Body tokens -> FlowHMR generation. --static_camera skips
@@ -21,18 +21,10 @@ import torch
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO_ROOT)
 
-DEFAULT_CKPT = os.path.join(REPO_ROOT, "checkpoints", "flowhmr_latest", "flowhmr_latest.ckpt")
-DEFAULT_MODEL_CFG = os.path.join(REPO_ROOT, "configs", "base", "model_basic05B.yml")
+from flowhmr.model_files import core_model_paths, missing_model_paths
+
 OUTPUT_ROOT = os.path.join(REPO_ROOT, "output")
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v")
-REQUIRED_FILES = [
-    "ckpts/yolox/yolox_l.pth",
-    "ckpts/vggt-omega/vggt_omega_1b_512.pt",
-    "ckpts/sam-3d-body-dinov3/model.ckpt",
-    "ckpts/sam-3d-body-dinov3/assets/mhr_model.pt",
-    "assets/body_models/smplh/neutral/model.npz",
-    "assets/body_models/smpl_neutral_J_regressor.pt",
-]
 
 
 def collect_videos(inputs):
@@ -50,13 +42,12 @@ def collect_videos(inputs):
     return [os.path.abspath(v) for v in videos]
 
 
-def check_files(ckpt, *, static_camera=False):
-    required = [f for f in REQUIRED_FILES if not (static_camera and f.startswith("ckpts/vggt-omega/"))]
-    missing = [f for f in required if not os.path.exists(os.path.join(REPO_ROOT, f))]
-    if not os.path.exists(ckpt):
-        missing.insert(0, ckpt)
+def check_files(ckpt, config):
+    required = core_model_paths(ckpt, config)
+    missing = missing_model_paths(required)
     if missing:
-        sys.exit("missing files (see docs/install.md):\n  " + "\n  ".join(missing))
+        sys.exit("missing files (see models/README.md):\n  " + "\n  ".join(missing))
+    return str(required[0]), str(required[1])
 
 
 def run_video(engine, video, args, tag):
@@ -92,8 +83,7 @@ def run_video(engine, video, args, tag):
 def parse_args():
     p = argparse.ArgumentParser(description="FlowHMR: raw video -> SMPL-H motion")
     p.add_argument("videos", nargs="+", help="video files and/or directories of videos")
-    p.add_argument("--ckpt", default=DEFAULT_CKPT,
-                   help="FlowHMR checkpoint (config.yml next to it)")
+    p.add_argument("--ckpt", help="FlowHMR checkpoint (default: models/flowhmr_latest/flowhmr_latest.ckpt)")
     p.add_argument("--model_cfg", default=None,
                    help="model config yaml (default: config.yml next to the ckpt)")
     p.add_argument("--device", default="cuda")
@@ -121,15 +111,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    args.ckpt = os.path.abspath(args.ckpt)
     videos = collect_videos(args.videos)
-    check_files(args.ckpt, static_camera=args.static_camera)
-
-    model_cfg = args.model_cfg
-    if model_cfg is None:
-        sibling = os.path.join(os.path.dirname(args.ckpt), "config.yml")
-        model_cfg = sibling if os.path.exists(sibling) else DEFAULT_MODEL_CFG
-    tag = os.path.splitext(os.path.basename(args.ckpt))[0]
+    ckpt, model_cfg = check_files(args.ckpt, args.model_cfg)
+    tag = os.path.splitext(os.path.basename(ckpt))[0]
     if args.seed != 0:
         tag += f"_seed{args.seed}"
 
@@ -139,7 +123,7 @@ def main():
 
     from flowhmr.pipeline.v2m_inference import V2MInferenceEngine
 
-    engine = V2MInferenceEngine.build(ckpt=args.ckpt, model_cfg_path=model_cfg,
+    engine = V2MInferenceEngine.build(ckpt=ckpt, model_cfg_path=model_cfg,
                                       device=args.device, validation_steps=args.steps,
                                       postprocess=args.postprocess)
 

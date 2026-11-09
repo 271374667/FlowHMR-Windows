@@ -7,6 +7,14 @@
 <a href="https://huggingface.co/fafsaf1/flowhmr-0.46B"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue" alt="Hugging Face Model"></a>
 </div>
 
+## Windows 桌面版
+
+这是基于 [FlowHMR 上游项目](https://github.com/flowhmr/flowhmr) 的独立 Windows 桌面发行版。原项目的论文、署名和 [许可证](LICENSE) 保留于本仓库。
+
+在本仓库的 Releases 下载 `FlowHMR-Windows.zip`，解压后双击 `FlowHMR.exe`。基础包已带 Python 和界面组件。生成前从右上角 **运行环境** 下载并启用一个 CUDA 版本，再在 **模型** 中下载公开模型、补齐官方 SMPL-H / MANO 文件。
+
+支持多人选取与同步预览、原声播放、手指精修、接触修正和多人 FBX 导出。模型在首次运行生成时才加载。见 [Windows 使用与源码构建说明](docs/windows.md) 和 [模型目录说明](models/README.md)。
+
 ## Overview
 
 - 🎉🎉🎉 [2026-10-31] Our [Hugging Face demo](https://huggingface.co/spaces/fafsaf1/FlowHMR) is now live!
@@ -51,7 +59,7 @@ FlowHMR supports two setups:
   Isaac Gym Preview 4, Python 3.8 + PyTorch 1.13, cu117). The two environments share no
   imports and communicate through files on `/dev/shm`.
 
-Some assets require license acceptance or gated access: the SMPL-family body models, VGGT-Omega, and SAM 3D Body.
+SMPL-family downloads require license acceptance. Use the ModelScope links in the installation guide for VGGT-Omega and SAM 3D Body.
 
 V2M:
 
@@ -69,8 +77,8 @@ Install FlowHMR from https://github.com/flowhmr/flowhmr following docs/install.m
 
 [Web demo guide](docs/web_demo.md)
 
-Upload a video in the browser and reconstruct its 3D motion; when several people are
-detected, pick the one to reconstruct. Requires the V2M setup.
+Upload a video and reconstruct its 3D motion; when several people are detected,
+select one or more for reconstruction. Requires the V2M setup.
 
 ```text
 Launch the FlowHMR web demo following docs/web_demo.md.

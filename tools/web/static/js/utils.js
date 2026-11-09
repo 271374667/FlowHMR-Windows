@@ -19,9 +19,9 @@ export function formatSeconds(s) {
 
 export function formatRelative(tsSeconds, nowSeconds) {
   const d = Math.max(0, (nowSeconds ?? Date.now() / 1000) - tsSeconds);
-  if (d < 60) return "just now";
-  if (d < 3600) return `${Math.floor(d / 60)} min ago`;
-  if (d < 86400) return `${Math.floor(d / 3600)} h ago`;
+  if (d < 60) return "刚刚";
+  if (d < 3600) return `${Math.floor(d / 60)} 分钟前`;
+  if (d < 86400) return `${Math.floor(d / 3600)} 小时前`;
   return new Date(tsSeconds * 1000).toLocaleString();
 }
 
@@ -31,10 +31,15 @@ export function formatBytes(n) {
 }
 
 export const STATUS_LABEL = {
-  uploading: "Uploading", queued: "Queued", running: "Running",
-  waiting_user: "Select person", cancel_requested: "Stopping", cancelled: "Stopped",
-  done: "Done", failed: "Failed",
+  uploading: "上传中", queued: "排队中", running: "运行中",
+  waiting_user: "等待选人", cancel_requested: "正在停止", cancelled: "已停止",
+  done: "已完成", failed: "失败", needs_alignment: "待对齐",
 };
+
+export function jobLabel(job) {
+  if (job.person_count > 1) return `${job.filename} · ${job.person_count} 人`;
+  return job.selected_person == null ? job.filename : `${job.filename} · 人物 ${job.selected_person + 1}`;
+}
 
 /** Distinct colours for person boxes; index = candidate index. */
 export const PERSON_COLORS = ["#3b82f6", "#f59e0b", "#8b5cf6", "#ec4899", "#14b8a6", "#ef4444", "#84cc16", "#0ea5e9"];

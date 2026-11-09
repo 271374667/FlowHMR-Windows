@@ -48,7 +48,7 @@ conda activate flowhmr
 python app.py
 ```
 
-The default checkpoint is `checkpoints/flowhmr_latest/flowhmr_latest.ckpt`.
+The default checkpoint is `models/flowhmr_latest/flowhmr_latest.ckpt`.
 After the log prints `FlowHMR web demo ready`, open `http://localhost:8080`
 on the same machine, or `http://<host>:8080` when connecting remotely.
 The page queues jobs on the selected GPU.

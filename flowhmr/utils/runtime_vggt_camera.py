@@ -9,6 +9,8 @@ converted to the V2M Y-up convention only when feeding the model.
 
 import os
 import os.path as osp
+import math
+import multiprocessing
 import shutil
 import sys
 import tempfile
@@ -20,14 +22,13 @@ import cv2
 import numpy as np
 import torch
 
+from flowhmr.model_files import VGGT, file_present, resolve_model
+from flowhmr.utils.runtime_image_io import write_image
 
 _repo_root = osp.normpath(osp.join(osp.dirname(__file__), "..", ".."))
 _vggt_repo_dir = osp.join(_repo_root, "third_party", "vggt-omega")
 if _vggt_repo_dir not in sys.path:
     sys.path.insert(0, _vggt_repo_dir)
-
-DEFAULT_VGGT_OMEGA_CKPT = osp.join(_repo_root, "ckpts", "vggt-omega", "vggt_omega_1b_512.pt")
-
 
 @dataclass
 class VGGTCameraResult:
@@ -38,6 +39,117 @@ class VGGTCameraResult:
 
 
 _VGGT_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+
+
+def camera_intervals(frames: int, requested: int) -> tuple[int, ...]:
+    """An explicit stride is exact. Auto starts with at most 64 camera samples."""
+    if requested < 0 or frames < 1:
+        raise ValueError("Invalid camera sampling interval or frame count")
+    if requested:
+        return (requested,)
+    return tuple(dict.fromkeys(max(1, math.ceil((frames - 1) / (count - 1)))
+                               for count in (64, 32, 16)))
+
+
+def _read_camera_cache(path, frame_range, expected_len, intervals):
+    if not path or not osp.isfile(path):
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            rt = data["RT_vggt"] if "RT_vggt" in data.files else data["camera_RT"]
+            intrinsics = data["K"]
+            interval = int(data["camera_sampling_interval"]) if "camera_sampling_interval" in data.files else 1
+            size = tuple(int(x) for x in data["image_size_hw"])
+            if (str(data["k_space"]) != "original_frame" or interval not in intervals
+                    or (expected_len is not None and rt.shape[0] != expected_len)
+                    or (frame_range is not None and not np.array_equal(data["frame_range"], frame_range))
+                    or rt.ndim != 3 or rt.shape[1:] != (4, 4) or intrinsics.shape != (len(rt), 3, 3)
+                    or len(size) != 2 or min(size) < 1 or not np.isfinite(rt).all()
+                    or not np.isfinite(intrinsics).all()):
+                return None
+            raw = rt.astype(np.float32)
+            return VGGTCameraResult(raw, raw, intrinsics.astype(np.float32), size)
+    except (KeyError, ValueError, OSError, TypeError, IndexError, BadZipFile):
+        return None
+
+
+_CAMERA_MEMORY_EXIT = 75
+
+
+def _camera_worker(video_path, output_npz, frame_range, frames, device, interval):
+    try:
+        device = torch.device(device)
+        if device.type == "cuda":
+            free, total = torch.cuda.mem_get_info(device)
+            reserve = max(1024 ** 3, int(total * 0.06))
+            if free <= reserve:
+                raise torch.cuda.OutOfMemoryError("No CUDA memory remains for camera estimation")
+            torch.cuda.set_per_process_memory_fraction((free - reserve) / total, device)
+        extract_vggt_camera(video_path, output_npz=output_npz, frame_range=frame_range,
+                            expected_len=frames, device=device, frame_interval=interval)
+    except torch.cuda.OutOfMemoryError as error:
+        print(f"  [vggt] CUDA memory limit: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(_CAMERA_MEMORY_EXIT) from None
+    except Exception as error:
+        # Pass a short diagnosis back to the job panel; the traceback still goes to stderr.
+        try:
+            with open(output_npz + ".error.txt", "w", encoding="utf-8") as report:
+                report.write(f"{type(error).__name__}: {error}")
+        except OSError:
+            pass
+        raise
+
+
+def extract_vggt_camera_isolated(video_path, *, output_npz, frame_range, expected_len,
+                                 device, frame_interval, cancel_check, on_progress):
+    """Run the expensive camera forward in a cancellable process with a VRAM budget."""
+    intervals = camera_intervals(expected_len, frame_interval)
+    cached = _read_camera_cache(output_npz, frame_range, expected_len, intervals)
+    if cached is not None:
+        print(f"  [vggt] skip cached camera: {output_npz}", flush=True)
+        on_progress("已复用相机估计")
+        return cached
+
+    with tempfile.TemporaryDirectory(prefix=".camera-", dir=osp.dirname(osp.abspath(output_npz))) as scratch:
+        temporary = osp.join(scratch, "camera.npz")
+        for interval in intervals:
+            cancel_check()
+            samples = (expected_len - 2) // interval + 2 if expected_len > 1 else 1
+            on_progress(f"相机采样 {samples}/{expected_len} 帧 · 间隔 {interval}")
+            process = multiprocessing.get_context("spawn").Process(
+                target=_camera_worker,
+                args=(video_path, temporary, frame_range, expected_len, str(device), interval),
+                daemon=True,
+            )
+            process.start()
+            try:
+                while process.is_alive():
+                    cancel_check()
+                    process.join(0.25)
+                cancel_check()
+                code = process.exitcode
+            finally:
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+                process.close()
+            if code == _CAMERA_MEMORY_EXIT:
+                continue
+            if code != 0:
+                try:
+                    with open(temporary + ".error.txt", encoding="utf-8") as report:
+                        detail = report.read(600).strip()
+                except OSError:
+                    detail = ""
+                if detail:
+                    raise RuntimeError(f"相机估计失败：{detail}")
+                raise RuntimeError(f"相机计算进程退出（{code}），请查看后台日志。")
+            result = _read_camera_cache(temporary, frame_range, expected_len, (interval,))
+            if result is None:
+                raise RuntimeError("相机计算没有产出有效结果。")
+            os.replace(temporary, output_npz)
+            return result
+    raise RuntimeError("相机估计显存不足。可增大采样间隔，固定机位素材可选择「固定机位」。")
 
 
 def make_static_camera(image_size_hw, *, frame_range, output_npz=None) -> VGGTCameraResult:
@@ -194,7 +306,7 @@ def _save_video_frames(
             should_save = (rel_idx % frame_interval == 0) or (end is not None and frame_idx == end)
             if should_save:
                 out_path = osp.join(frame_dir, f"{len(paths):06d}.jpg")
-                cv2.imwrite(out_path, frame)
+                write_image(out_path, frame)
                 paths.append(out_path)
                 sample_indices.append(rel_idx)
             frame_idx += 1
@@ -212,7 +324,7 @@ def extract_vggt_camera(
     output_npz: Optional[str] = None,
     frame_range: Optional[Tuple[int, int]] = None,
     expected_len: Optional[int] = None,
-    checkpoint_path: str = DEFAULT_VGGT_OMEGA_CKPT,
+    checkpoint_path: Optional[str] = None,
     device: torch.device | str = "cuda",
     image_resolution: int = 512,
     preprocess_mode: str = "max_size",
@@ -220,39 +332,14 @@ def extract_vggt_camera(
     frame_interval: int = 1,
 ) -> VGGTCameraResult:
     frame_interval = max(1, int(frame_interval))
-    if output_npz and osp.exists(output_npz):
-        data = np.load(output_npz)
-        k_space = str(data["k_space"]) if "k_space" in data.files else ""
-        # New cache: camera_RT/RT are raw VGGT OpenCV. Old cache may have
-        # converted camera_RT, but still stores raw RT_vggt; prefer RT_vggt.
-        camera_RT = (data["RT_vggt"] if "RT_vggt" in data.files else data["camera_RT"]).astype(np.float32)
-        image_size_arr = data["image_size_hw"]
-        image_size_hw = (int(image_size_arr[0]), int(image_size_arr[1]))
-        cached_interval = int(data["camera_sampling_interval"]) if "camera_sampling_interval" in data.files else 1
-        valid_interval = cached_interval == frame_interval
-        valid_len = expected_len is None or camera_RT.shape[0] == int(expected_len)
-        valid_range = frame_range is None or (
-            "frame_range" in data.files and np.array_equal(data["frame_range"], frame_range)
-        )
-        valid_k = data["K"].shape == (camera_RT.shape[0], 3, 3)
-        if k_space == "original_frame" and valid_len and valid_interval and valid_range and valid_k:
-            print(f"  [vggt] skip cached camera: {output_npz}")
-            return VGGTCameraResult(
-                camera_RT=camera_RT,
-                RT_vggt=camera_RT,
-                K=data["K"].astype(np.float32),
-                image_size_hw=image_size_hw,
-            )
-        if k_space != "original_frame":
-            print(f"  [vggt] cached camera K is not original-frame space ({k_space!r}), recomputing")
-        elif not valid_interval:
-            print(f"  [vggt] cached camera interval mismatch: {cached_interval} != {frame_interval}, recomputing")
-        elif not valid_range:
-            print("  [vggt] cached frame range mismatch, recomputing")
-        elif not valid_k:
-            print("  [vggt] cached camera intrinsics length mismatch, recomputing")
-        else:
-            print(f"  [vggt] cached camera length mismatch: {camera_RT.shape[0]} != {expected_len}, recomputing")
+    cached = _read_camera_cache(output_npz, frame_range, expected_len, (frame_interval,))
+    if cached is not None:
+        print(f"  [vggt] skip cached camera: {output_npz}")
+        return cached
+
+    checkpoint_path = checkpoint_path or str(resolve_model(VGGT))
+    if not file_present(checkpoint_path):
+        raise FileNotFoundError(f"VGGT-Omega 缺少相机模型：{checkpoint_path}。固定机位模式不需要此模型。")
 
     device_obj = torch.device(device)
     if device_obj.type == "cuda" and not torch.cuda.is_available():
@@ -374,7 +461,7 @@ def load_or_extract_vggt_camera_rt(
     frame_range: Optional[Tuple[int, int]],
     expected_len: int,
     device: torch.device | str,
-    checkpoint_path: str = DEFAULT_VGGT_OMEGA_CKPT,
+    checkpoint_path: Optional[str] = None,
     image_resolution: int = 512,
     frame_interval: int = 1,
 ) -> torch.Tensor:

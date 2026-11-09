@@ -17,7 +17,7 @@ python run_v2m_demo_generation.py a.mp4 b.mov my_videos/
 
 | Option | Default | Description |
 |---|---|---|
-| `--ckpt` | `checkpoints/flowhmr_latest/flowhmr_latest.ckpt` | Model checkpoint |
+| `--ckpt` | `models/flowhmr_latest/flowhmr_latest.ckpt` | Model checkpoint |
 | `--model_cfg` | auto | Model YAML; uses `config.yml` beside the checkpoint |
 | `--device` | `cuda` | Inference device, e.g. `cuda:0` |
 | `--seed` | `0` | Random seed |

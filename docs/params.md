@@ -22,7 +22,7 @@ Workflow: [web_demo.md](web_demo.md).
 
 | Option | Default | Description |
 |---|---|---|
-| `--ckpt` | `checkpoints/flowhmr_latest/flowhmr_latest.ckpt` | FlowHMR checkpoint |
+| `--ckpt` | `models/flowhmr_latest/flowhmr_latest.ckpt` | FlowHMR checkpoint |
 | `--model_cfg` | auto | Uses `config.yml` beside the checkpoint; otherwise `configs/base/model_basic05B.yml` |
 | `--host` | `0.0.0.0` | Server bind address |
 | `--port` | `8080` | Server port |
@@ -49,7 +49,7 @@ Workflow: [inference.md](inference.md).
 | Option | Default | Description |
 |---|---|---|
 | `videos` | required | One or more video paths or directories of videos |
-| `--ckpt` | `checkpoints/flowhmr_latest/flowhmr_latest.ckpt` | FlowHMR checkpoint |
+| `--ckpt` | `models/flowhmr_latest/flowhmr_latest.ckpt` | FlowHMR checkpoint |
 | `--model_cfg` | auto | Uses sibling `config.yml`; otherwise `configs/base/model_basic05B.yml` |
 | `--device` | `cuda` | Device for the models |
 | `--seed` | `0` | Sampling seed; nonzero seeds add `_seed<N>` to the result name |
@@ -67,7 +67,7 @@ ambiguity when the launcher changes to the repository root.
 
 ```bash
 python run_v2m_demo_generation.py assets/example/example.mp4 \
-    --ckpt checkpoints/flowhmr_base/flowhmr_base.ckpt --vggt_interval 10
+    --ckpt models/flowhmr_base/flowhmr_base.ckpt --vggt_interval 10
 ```
 
 ## Camera settings
@@ -153,7 +153,7 @@ These settings live in [configs/grpo/model.yml](../configs/grpo/model.yml).
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `load_from_checkpoint` | `checkpoints/flowhmr_base/flowhmr_base.ckpt` | Base model initialization |
+| `load_from_checkpoint` | `models/flowhmr_base/flowhmr_base.ckpt` | Base model initialization |
 | `grpo.num_generations` | `8` | Samples per group |
 | `grpo.sampling_steps` | `20` | Rollout steps |
 | `grpo.inner_updates` | `4` | Optimization updates |

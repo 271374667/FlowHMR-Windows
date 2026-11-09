@@ -12,10 +12,10 @@ import supervision as sv
 import torch
 from torch import Tensor
 
+from flowhmr.model_files import YOLOX, file_present, resolve_model
 
 # Repo root (for locating checkpoints)
 _repo_root = osp.normpath(osp.join(osp.dirname(__file__), "..", ".."))
-_YOLOX_CKPT_PATH = osp.join(_repo_root, "ckpts", "yolox", "yolox_l.pth")
 
 
 def find_ffmpeg() -> str:
@@ -129,9 +129,10 @@ class YOLOXHumanDetector:
 
 def build_human_detector(device: torch.device) -> YOLOXHumanDetector:
     """Build YOLOX-L human detector. Raises FileNotFoundError if weights missing."""
-    if not osp.exists(_YOLOX_CKPT_PATH):
-        raise FileNotFoundError(f"YOLOX checkpoint not found: {_YOLOX_CKPT_PATH}")
-    return YOLOXHumanDetector(ckpt_path=_YOLOX_CKPT_PATH, device=device)
+    ckpt_path = resolve_model(YOLOX)
+    if not file_present(ckpt_path):
+        raise FileNotFoundError(f"YOLOX checkpoint not found: {ckpt_path}")
+    return YOLOXHumanDetector(ckpt_path=str(ckpt_path), device=device)
 
 
 class VideoProcessor:
@@ -223,7 +224,8 @@ class VideoProcessor:
                     cmd += ["-q:v", "5"]
             else:
                 cmd += ["-c:v", "copy"]
-            cmd += ["-an", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", tmp_path]
+            cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k",
+                    "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", tmp_path]
             return cmd
 
         if force_fps:
@@ -473,7 +475,7 @@ if __name__ == "__main__":
     print(f"[video_meta] {meta.width}x{meta.height}, {meta.fps:.1f}fps, {meta.total_frames} frames")
 
     # 2. Build detector
-    print(f"[detector] YOLOX ckpt: {_YOLOX_CKPT_PATH}")
+    print(f"[detector] YOLOX ckpt: {resolve_model(YOLOX)}")
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     detector = build_human_detector(device)
     print(f"[detector] OK on {device}")

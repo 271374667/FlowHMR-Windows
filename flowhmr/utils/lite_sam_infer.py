@@ -26,7 +26,7 @@ def _combine_batches(batches, device):
 
 @torch.no_grad()
 def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
-                   merge_hands=False):
+                   merge_hands=False, hand_boxes_out=None, hand_boxes_only=False):
     """Return CPU float32 ``(frames, 3072)`` tokens in body/left/right order.
 
     ``images`` contains RGB uint8 frames, one selected person per frame.
@@ -52,7 +52,8 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
     device = torch.device(estimator.device)
     model = estimator.model
     body_tokens, hand_tokens = [], []
-    original_single = len(images) == 1 and not gpu_preprocess and not merge_hands
+    original_single = (len(images) == 1 and not gpu_preprocess and not merge_hands
+                       and hand_boxes_out is None and not hand_boxes_only)
 
     def capture_body(_module, _args, output):
         body_tokens.append(output[0].detach() if original_single else output[0][:, 0].detach().clone())
@@ -87,8 +88,9 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
     handles = []
     try:
         with context:
-            handles.append(model.decoder.register_forward_hook(capture_body))
-            handles.append(model.decoder_hand.register_forward_hook(capture_hand))
+            if not hand_boxes_only:
+                handles.append(model.decoder.register_forward_hook(capture_body))
+                handles.append(model.decoder_hand.register_forward_hook(capture_hand))
             if original_single:
                 # Keep the public estimator's exact preprocessing and scheduling
                 # for the default path. Only computation after both hand tokens
@@ -113,6 +115,8 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
             geometry = {"affine_trans": body_batch["affine_trans"].flatten(0, 1).unsqueeze(0)}
             left_boxes, right_boxes = model._get_hand_box(body, geometry)
             del body, body_batch
+            if hand_boxes_only:
+                return torch.from_numpy(np.stack((left_boxes, right_boxes), axis=1).astype(np.float32))
 
             def run_hands(indices, sides):
                 batches = []
@@ -140,7 +144,10 @@ def extract_tokens(estimator, images, boxes, cameras, *, gpu_preprocess=False,
                 run_hands(range(len(images)), ("left",))
                 run_hands(range(len(images)), ("right",))
 
-            return collected_tokens()
+            tokens = collected_tokens()
+            if hand_boxes_out is not None:
+                hand_boxes_out.append(np.stack((left_boxes, right_boxes), axis=1).astype(np.float32))
+            return tokens
     finally:
         for handle in handles:
             handle.remove()

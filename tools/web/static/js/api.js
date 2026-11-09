@@ -17,7 +17,14 @@ const postJson = (path, body) => json(path, {
   body: JSON.stringify(body || {}),
 });
 
-export const getInfo = () => json("/api/info");
+export const getInfo = () => json("/api/info", { cache: "no-store" });
+export const getModelDownload = () => json("/api/models/download", { cache: "no-store" });
+export const startModelDownload = () => postJson("/api/models/download");
+export const stopModelDownload = (id) => postJson("/api/models/download/stop", { id });
+export const getRuntime = () => json("/api/runtime", { cache: "no-store" });
+export const startRuntimeDownload = (version) => postJson("/api/runtime/download", { version });
+export const stopRuntimeDownload = (id) => postJson("/api/runtime/download/stop", { id });
+export const selectRuntime = (version) => postJson("/api/runtime/select", { version });
 export const getJobs = () => json("/api/jobs");
 export const deleteJobs = (ids) => json("/api/jobs", {
   method: "DELETE",
@@ -25,17 +32,29 @@ export const deleteJobs = (ids) => json("/api/jobs", {
   body: JSON.stringify(ids ? { ids } : {}),
 });
 export const getJob = (id) => json(`/api/jobs/${id}`);
-export const getMeta = (id) => json(`/api/jobs/${id}/meta`);
-export const getVertices = (id) => request(`/api/jobs/${id}/vertices`).then((r) => r.arrayBuffer());
-export const getFaces = (id) => request(`/api/jobs/${id}/faces`).then((r) => r.arrayBuffer());
-export const selectPerson = (id, person) => postJson(`/api/jobs/${id}/select`, { person });
+export const getMeta = (id, signal) => json(`/api/jobs/${id}/meta`, { signal });
+export const getVertices = (id, signal, body = "neutral") => request(`/api/jobs/${id}/vertices?body=${encodeURIComponent(body)}`, { signal }).then((r) => r.arrayBuffer());
+export const getFaces = (id, signal) => request(`/api/jobs/${id}/faces`, { signal }).then((r) => r.arrayBuffer());
+export async function getInspection(id, signal) {
+  const response = await request(`/api/jobs/${id}/skeleton`, { signal });
+  const info = JSON.parse(response.headers.get("X-FlowHMR-Inspection"));
+  return { ...info, joints: new Float32Array(await response.arrayBuffer()) };
+}
+export const selectPeople = (id, people) => postJson(`/api/jobs/${id}/select`,
+  people.length === 1 ? { people, person: people[0] } : { people });
 export const rerunJob = (id, params) => postJson(`/api/jobs/${id}/rerun`, params).then((res) => res.job_id);
 export const cancelJob = (id) => postJson(`/api/jobs/${id}/cancel`);
+export const prepareScene = (id) => postJson(`/api/jobs/${id}/scene`);
 
 export const videoUrl = (id) => `/api/jobs/${id}/video`;
 export const npzUrl = (id) => `/api/jobs/${id}/npz`;
-export const fbxUrl = (id) => `/api/jobs/${id}/fbx`;
+export const fbxUrl = (id, withSkin, body = "neutral", people = []) => {
+  const query = new URLSearchParams({ mesh: withSkin ? "1" : "0", body });
+  for (const person of people) query.append("person", String(person));
+  return `/api/jobs/${id}/fbx?${query}`;
+};
 export const personThumbUrl = (id, i) => `/api/jobs/${id}/person/${i}.jpg`;
+export const thumbnailUrl = (id) => `/api/jobs/${id}/thumbnail.jpg`;
 
 /** Upload a video with per-job parameters. Resolves to the new job id. */
 export function uploadVideo(file, params, onProgress) {

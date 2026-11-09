@@ -19,7 +19,7 @@ from transforms3d.euler import mat2euler
 # Constants (Centralized)
 
 DEFAULT_EULER_AXES = "sxyz"
-DEFAULT_INTERP = fbx.FbxAnimCurveDef.EInterpolationType.eInterpolationConstant
+DEFAULT_INTERP = fbx.FbxAnimCurveDef.EInterpolationType.eInterpolationLinear
 
 
 # yapf: disable
@@ -81,16 +81,17 @@ def export_scene_atomic(
     with tempfile.NamedTemporaryFile(suffix=".fbx", delete=False, dir=out_dir) as tmp:
         tmp_path = tmp.name
 
-    exporter = fbx.FbxExporter.Create(mgr, "")
     try:
-        if not exporter.Initialize(tmp_path, -1, ios):
-            raise RuntimeError(f"Exporter failed: {exporter.GetStatus().GetErrorString()}")
-        exporter.Export(scene)
+        exporter = fbx.FbxExporter.Create(mgr, "")
+        try:
+            if not exporter.Initialize(tmp_path, -1, ios) or not exporter.Export(scene):
+                raise RuntimeError(f"FBX export failed: {exporter.GetStatus().GetErrorString()}")
+        finally:
+            exporter.Destroy()
+        os.replace(tmp_path, out_path)
     finally:
-        exporter.Destroy()
-
-    # Replace destination (atomic on POSIX when same filesystem)
-    os.replace(tmp_path, out_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 # Node traversal / scene edits
@@ -158,13 +159,14 @@ def mat2euler_deg(R: np.ndarray, axes: str = DEFAULT_EULER_AXES) -> np.ndarray:
     return np.rad2deg(mat2euler(np.asarray(R, dtype=np.float64), axes=axes))
 
 
-def animate_single_channel(anim_layer, component, axis: str, values: np.ndarray, frame_duration: float) -> None:
+def animate_single_channel(anim_layer, component, axis: str, values: np.ndarray, frame_duration: float,
+                           start_frame: int = 0) -> None:
     ncomp = {"X": 0, "Y": 1, "Z": 2}.get(axis, 0)
     curve = component.GetCurve(anim_layer, axis, True)
     curve.KeyModifyBegin()
     time = fbx.FbxTime()
     for i, val in enumerate(values):
-        time.SetSecondDouble(i * frame_duration)
+        time.SetSecondDouble((start_frame + i) * frame_duration)
         idx = curve.KeyAdd(time)[0]
         curve.KeySetValue(idx, float(val[ncomp] if isinstance(val, (list, np.ndarray)) else val))
         curve.KeySetInterpolation(idx, DEFAULT_INTERP)
@@ -172,14 +174,23 @@ def animate_single_channel(anim_layer, component, axis: str, values: np.ndarray,
 
 
 def animate_rotation_from_rotmats(
-    anim_layer, node, rot_mats: np.ndarray, frame_duration: float, axes: str = DEFAULT_EULER_AXES
+    anim_layer, node, rot_mats: np.ndarray, frame_duration: float, axes: str = DEFAULT_EULER_AXES,
+    *, start_frame: int = 0,
 ) -> None:
     eulers = np.array([mat2euler_deg(m, axes) for m in rot_mats])
+    if axes == DEFAULT_EULER_AXES:
+        # Choose the closer equivalent XYZ branch and unwrap it between keys.
+        for i in range(1, len(eulers)):
+            x, y, z = eulers[i]
+            choices = np.array([(x, y, z), (x + 180., 180. - y, z + 180.)])
+            delta = (choices - eulers[i - 1] + 180.) % 360. - 180.
+            eulers[i] = eulers[i - 1] + delta[np.argmin((delta * delta).sum(axis=1))]
     for axis in ["X", "Y", "Z"]:
-        animate_single_channel(anim_layer, node.LclRotation, axis, eulers, frame_duration)
+        animate_single_channel(anim_layer, node.LclRotation, axis, eulers, frame_duration, start_frame)
 
 
-def animate_translation(anim_layer, node, translations: np.ndarray, frame_duration: float) -> None:
+def animate_translation(anim_layer, node, translations: np.ndarray, frame_duration: float,
+                        *, start_frame: int = 0) -> None:
     translations = np.asarray(translations, dtype=np.float64)
     if translations.ndim == 1:
         if translations.shape[0] != 3:
@@ -191,17 +202,18 @@ def animate_translation(anim_layer, node, translations: np.ndarray, frame_durati
     else:
         raise ValueError(f"Translation must be 1D or 2D, got {translations.ndim}D")
     for axis in ["X", "Y", "Z"]:
-        animate_single_channel(anim_layer, node.LclTranslation, axis, translations, frame_duration)
+        animate_single_channel(anim_layer, node.LclTranslation, axis, translations, frame_duration, start_frame)
 
 
 # Construction Helpers
 
 
 def build_mesh_node(
-    scene: fbx.FbxScene, vertices: np.ndarray, faces: np.ndarray, name: str = "body", uv_coords=None, uv_faces=None
+    scene: fbx.FbxScene, vertices: np.ndarray, faces: np.ndarray, name: str = "body", uv_coords=None, uv_faces=None,
+    *, parent_node=None, node_name="Geometry",
 ) -> fbx.FbxNode:
-    geo_node = fbx.FbxNode.Create(scene, "Geometry")
-    scene.GetRootNode().AddChild(geo_node)
+    geo_node = fbx.FbxNode.Create(scene, node_name)
+    (parent_node or scene.GetRootNode()).AddChild(geo_node)
 
     mesh = fbx.FbxMesh.Create(scene, name)
     geo_node.SetNodeAttribute(mesh)
@@ -239,29 +251,34 @@ def build_mesh_node(
 
 
 def build_skeleton_nodes(
-    mgr: fbx.FbxManager, scene: fbx.FbxScene, joints_pos: np.ndarray, parents: np.ndarray, joint_names: List[str]
+    mgr: fbx.FbxManager, scene: fbx.FbxScene, joints_pos: np.ndarray, parents: np.ndarray, joint_names: List[str],
+    *, rest_rotations=None, tip_lengths=None, parent_node=None, reference_name="FlowHMR Motion",
 ) -> List[fbx.FbxNode]:
     """Build skeleton nodes. parents array is not modified (safe to pass original)."""
-    root_node = scene.GetRootNode()
-    ref_node = fbx.FbxNode.Create(scene, "Reference")
+    root_node = parent_node or scene.GetRootNode()
+    ref_node = fbx.FbxNode.Create(scene, reference_name)
     root_node.AddChild(ref_node)
 
     # Ensure parents is a copy to avoid modifying caller's array
     parents = np.asarray(parents, dtype=np.int32).copy()
     joints_pos = np.asarray(joints_pos, dtype=np.float64)
 
-    skel_nodes = []
-    for i, name in enumerate(joint_names):
+    def make_limb(name, position):
         skel = fbx.FbxSkeleton.Create(mgr, "")
-        # All joints use eLimbNode for Blender FBX import compatibility
         skel.SetSkeletonType(fbx.FbxSkeleton.EType.eLimbNode)
-
         node = fbx.FbxNode.Create(scene, name)
         node.SetNodeAttribute(skel)
-        node.LclTranslation.Set(
-            fbx.FbxDouble3(float(joints_pos[i, 0]), float(joints_pos[i, 1]), float(joints_pos[i, 2]))
-        )
+        node.LclTranslation.Set(fbx.FbxDouble3(*map(float, position)))
+        return node
 
+    skel_nodes = []
+    pivot = fbx.FbxNode.EPivotSet.eSourcePivot
+    for i, name in enumerate(joint_names):
+        node = make_limb(name, joints_pos[i])
+        if rest_rotations is not None:
+            node.SetRotationActive(True)
+            node.SetPivotState(pivot, fbx.FbxNode.EPivotState.ePivotActive)
+            node.SetPreRotation(pivot, fbx.FbxVector4(*map(float, mat2euler_deg(rest_rotations[i]))))
         skel_nodes.append(node)
         if parents[i] != -1:
             if parents[i] < 0 or parents[i] >= len(skel_nodes):
@@ -270,7 +287,9 @@ def build_skeleton_nodes(
 
     if len(skel_nodes) == 0:
         raise ValueError("No skeleton nodes created")
-    ref_node.AddChild(skel_nodes[0]) # Assuming 0 is root
+    ref_node.AddChild(skel_nodes[0])  # The armature container is not a bone.
+    for i, length in (tip_lengths or {}).items():
+        skel_nodes[i].AddChild(make_limb(joint_names[i] + "_end", (0., length, 0.)))
     return skel_nodes
 
 
@@ -306,7 +325,7 @@ def apply_skinning(
 
     mesh_node.GetNodeAttribute().AddDeformer(skin)
 
-    _store_bind_pose(scene, mesh_node)
+    store_bind_pose(scene, [*skel_nodes, mesh_node])
 
 
 def _add_node_recursively(node_array: List[fbx.FbxNode], node: fbx.FbxNode) -> None:
@@ -318,41 +337,15 @@ def _add_node_recursively(node_array: List[fbx.FbxNode], node: fbx.FbxNode) -> N
         node_array.append(node)
 
 
-def _store_bind_pose(scene: fbx.FbxScene, geometry_node: fbx.FbxNode) -> None:
-    """Store bind pose by recursively collecting all related nodes.
-
-    Traverses all skin clusters on the mesh, recursively collects each link bone
-    and its parents into the bind pose. This matches the FBX SDK recommended approach
-    and ensures correct skinning in Blender and other DCC tools.
-    """
-    if geometry_node is None or geometry_node.GetNodeAttribute() is None:
-        return
-
-    clustered_nodes: List[fbx.FbxNode] = []
-    attr = geometry_node.GetNodeAttribute()
-    attr_type = attr.GetAttributeType()
-
-    if attr_type in (
-        fbx.FbxNodeAttribute.EType.eMesh,
-        fbx.FbxNodeAttribute.EType.eNurbs,
-        fbx.FbxNodeAttribute.EType.ePatch,
-    ):
-        skin_count = attr.GetDeformerCount(fbx.FbxDeformer.EDeformerType.eSkin)
-        for i in range(skin_count):
-            skin = attr.GetDeformer(i, fbx.FbxDeformer.EDeformerType.eSkin)
-            for j in range(skin.GetClusterCount()):
-                link = skin.GetCluster(j).GetLink()
-                _add_node_recursively(clustered_nodes, link)
-
-    clustered_nodes.append(geometry_node)
-
-    if not clustered_nodes:
-        return
-
-    pose = fbx.FbxPose.Create(scene, geometry_node.GetName())
+def store_bind_pose(scene: fbx.FbxScene, nodes: List[fbx.FbxNode]) -> None:
+    """Record the same neutral bone frames with or without a skin."""
+    bound_nodes: List[fbx.FbxNode] = []
+    for node in nodes:
+        _add_node_recursively(bound_nodes, node)
+    pose = fbx.FbxPose.Create(scene, "BindPose")
     pose.SetIsBindPose(True)
     evaluator = scene.GetAnimationEvaluator()
-    for node in clustered_nodes:
+    for node in bound_nodes:
         bind_matrix = evaluator.GetNodeGlobalTransform(node)
         pose.Add(node, fbx.FbxMatrix(bind_matrix))
     scene.AddPose(pose)

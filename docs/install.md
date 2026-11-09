@@ -41,96 +41,12 @@ plain `venv` instead of conda, run `pip install wheel` before installing YOLOX.
 Check: `python -c "import torch, yolox; print(torch.__version__, torch.cuda.is_available())"`
 prints `2.5.1+cu118 True`.
 
-**Perception checkpoints.** VGGT-Omega and SAM 3D Body are gated **[manual]**. Request
-access on [VGGT-Omega](https://huggingface.co/facebook/VGGT-Omega) and
-[SAM 3D Body](https://huggingface.co/facebook/sam-3d-body-dinov3), then run
-`huggingface-cli login`.
-
-```bash
-mkdir -p ckpts/yolox
-wget -O ckpts/yolox/yolox_l.pth https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_l.pth
-huggingface-cli download facebook/VGGT-Omega vggt_omega_1b_512.pt --local-dir ckpts/vggt-omega
-huggingface-cli download facebook/sam-3d-body-dinov3 --local-dir ckpts/sam-3d-body-dinov3
-```
-
-```
-ckpts/
-├── yolox/yolox_l.pth
-├── vggt-omega/vggt_omega_1b_512.pt
-└── sam-3d-body-dinov3/{model.ckpt, model_config.yaml, assets/mhr_model.pt}
-```
-
-**Optional: FBX export** (verified on Python 3.10 only). Without it, `.npz` results are
-still saved and the `.fbx` export is skipped.
-
-```bash
-pip install fbxsdkpy==2020.1.post2 --extra-index-url https://gitlab.inria.fr/api/v4/projects/18692/packages/pypi/simple
-```
-
-### Optional post-processing
-
-Install the bundled [RGBMocap correction](../third_party/RGBMocapCorrection) and its
-[Kimodo native solver](../third_party/KimodoMotionCorrection). The native solver
-requires a C++17 compiler and CMake ≥ 3.15. Enable correction with CLI `--postprocess`
-or the Web **Post-processing** toggle (both off by default).
-
-```bash
-pip install pybind11==2.11.1
-pip install --no-build-isolation --no-deps ./third_party/KimodoMotionCorrection
-pip install --no-build-isolation --no-deps ./third_party/RGBMocapCorrection
-```
-
-CMake uses an installed Eigen ≥ 3.3 or downloads Eigen 3.4.0. For an offline build,
-prefix the second command with `CMAKE_ARGS="-DEigen3_DIR=/path/to/eigen/share/eigen3/cmake"`.
-
-Uses RGBMocap's **normal**, **flat ground**, **automatic floor**, **foot lock on**,
-**hand lock off** defaults, including contact planning, pelvis correction and anatomical IK.
-
-## 3. Simulation environment (full pipeline only)
-
-**Apply the PHC+ patches** once:
-
-```bash
-cd third_party/PerpetualHumanoidControl
-git apply ../patches/*.patch
-cd ../..
-```
-
-| Patch (`third_party/patches/`) | Change |
-|---|---|
-| `0001-smpl_humanoid-axes` | SMPL humanoid MJCF axis convention |
-| `0002-base_task-headless-render` | headless rendering + automatic video recording |
-| `0003-draw_utils-matplotlib-compat` | matplotlib >= 3.7 compatibility |
-| `0004-amass-stats-in-example-dir` | read AMASS shape stats from `assets/example/` |
-
-Check: `(cd third_party/PerpetualHumanoidControl && git apply --check --reverse ../patches/*.patch)`
-succeeds.
-
-**Install Isaac Gym [manual].** NVIDIA Isaac Gym Preview (Linux only) is required. Install
-it into its own Python environment following NVIDIA's official instructions. We validated
-Isaac Gym Preview 4 with Python 3.8 and PyTorch 1.13 (cu117). Then, in that environment
-(`phc` below):
-
-```bash
-pip install -r requirements-phc.txt
-pip install --no-build-isolation git+https://github.com/mattloper/chumpy
-```
-
-This installs `smpl_sim` and `smplx` from their public repos, plus the PHC dependencies.
-`requirements-phc.txt` constrains `torch<2.0` so the Isaac Gym PyTorch is kept. `chumpy`
-is needed to load the SMPL `.pkl` files and must be installed without build isolation.
-
-Check: `python -c "from isaacgym import gymapi; import torch; from isaacgym import gymtorch; import rl_games, smpl_sim"`.
-`gymtorch` compiles an extension on first import. If it fails with `Ninja is required`,
-run `pip install ninja`.
-
-**GPU notes**
-
-- Launch the score server and the evaluator with `--device-id <physical GPU>`. Do not
-  remap GPUs with `CUDA_VISIBLE_DEVICES`, because PhysX may deadlock silently.
-- The reward client adds the simulator Python's `bin/` directory to `PATH` automatically.
-- For GRPO, set `grpo.sim.phc_python` in `configs/grpo/model.yml` to the `phc`
-  environment's Python (see [training.md](training.md)).
+[models/README.md](../models/README.md) lists the complete model directory layout. Run
+`python tools/windows/download_models.py` to install the public weights. The downloader uses
+[Meta's SAM 3D Body DINOv3](https://www.modelscope.cn/models/facebook/sam-3d-body-dinov3)
+and [VGGT-Omega](https://www.modelscope.cn/models/facebook/VGGT-Omega) on ModelScope
+and verifies the files against the known SHA-256 values. Both must be installed;
+fixed-camera mode skips VGGT inference.
 
 ## 4. Data
 
@@ -139,6 +55,7 @@ run `pip install ninja`.
 Download the SMPL-family models after registering:
 
 - **V2M**: SMPL-H neutral from [MANO](https://mano.is.tue.mpg.de/) (AMASS `smplh_amass_neutral`).
+- For the desktop body templates and hand refinement, place the official `mano_v1_2` directory intact under `models/`.
 - **Full pipeline**: also [SMPL](https://smpl.is.tue.mpg.de/) v1.1.0 under `data/smpl/`, read by
   `smpl_sim`. Rename `basicmodel_{neutral,m,f}_lbs_10_207_0_v1.1.0.pkl` to
   `SMPL_{NEUTRAL,MALE,FEMALE}.pkl`. SMPL-X is not needed (the simulator uses the `smpl_humanoid` robot).
@@ -146,12 +63,12 @@ Download the SMPL-family models after registering:
 The joint regressor is public:
 
 ```bash
-wget -O assets/body_models/smpl_neutral_J_regressor.pt \
+wget -O models/body_models/smpl_neutral_J_regressor.pt \
     https://raw.githubusercontent.com/zju3dv/GVHMR/main/hmr4d/utils/body_model/smpl_neutral_J_regressor.pt
 ```
 
 ```
-assets/body_models/                 # V2M, required
+models/body_models/                 # V2M, required
 ├── smplh/neutral/model.npz
 └── smpl_neutral_J_regressor.pt
 
@@ -181,13 +98,13 @@ If Google Drive rate-limits the download, fetch the files manually from the PHC 
 ### 4.3 FlowHMR checkpoints
 
 ```bash
-huggingface-cli download fafsaf1/flowhmr-0.46B --local-dir checkpoints
+huggingface-cli download fafsaf1/flowhmr-0.46B --local-dir models
 # or only the recommended model:
-huggingface-cli download fafsaf1/flowhmr-0.46B --include "flowhmr_latest/*" "config.json" --local-dir checkpoints
+huggingface-cli download fafsaf1/flowhmr-0.46B --include "flowhmr_latest/*" "config.json" --local-dir models
 ```
 
 ```
-checkpoints/
+models/
 ├── flowhmr_base/{flowhmr_base.ckpt, config.yml}
 └── flowhmr_latest/{flowhmr_latest.ckpt, config.yml}
 ```

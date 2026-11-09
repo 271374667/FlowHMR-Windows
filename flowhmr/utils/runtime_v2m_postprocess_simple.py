@@ -11,7 +11,7 @@ from flowhmr.core.math.geometry import rot6d_to_rotation_matrix
 
 
 class PostprocessPipeline:
-    """Run RGBMocap's default normal/flat correction on the CPU."""
+    """Run RGBMocap's flat-ground contact correction on the CPU."""
 
     def __init__(self, body_model, smpl_mesh):
         try:
@@ -34,21 +34,28 @@ class PostprocessPipeline:
         self.body_model = body_model
         self.smpl_mesh = smpl_mesh
         self._mesh_cpu = copy.deepcopy(smpl_mesh).cpu().float().eval()
-        self.options = correction_options()
-        self.last_report = None
+        self._correction_options = correction_options
+        self.configure()
 
     @classmethod
     def default(cls, body_model=None, smpl_mesh=None):
         return cls(body_model, smpl_mesh)
 
+    def configure(self, height_m=None, *, preset="normal", sole_fit_strength=0.0):
+        self.options = self._correction_options({"auto_floor": height_m is None, "floor": height_m, "preset": preset})
+        self.sole_fit_strength = sole_fit_strength
+        self.last_report = None
+
     @torch.no_grad()
-    def run(self, output: dict, **kwargs) -> dict:
+    def run(self, output: dict, *, cancel_check=None, **kwargs) -> dict:
         from rgbmocap_correction.correction import correct_arrays, prepare_contacts, sole_metrics
         from rgbmocap_correction.flow_correction import SoleGeometry, contact_probabilities
         from rgbmocap_correction.flow_export import proper_rotations
         from rgbmocap_correction.hand_lock import apply as apply_hands
 
         started = time.perf_counter()
+        check = cancel_check or (lambda: None)
+        check()
         rot6d, trans, shapes = output["rot6d"], output["trans"], output["shapes"]
         if rot6d.ndim != 4 or rot6d.shape[0] != 1 or rot6d.shape[2:] != (52, 6):
             raise ValueError("Expected SMPL-H rotations (1, T, 52, 6)")
@@ -70,18 +77,46 @@ class PostprocessPipeline:
         quats = quats.reshape(length, 22, 4)[..., [3, 0, 1, 2]].astype(np.float32)
         roots = trans[0].float().cpu().numpy() + geometry.rest[0]
         probabilities = contact_probabilities({"foot_contacts": contacts.detach().float().cpu()}, length)
-        probes = np.empty((length, 4, 3), np.float32)
-        for start in range(0, length, 128):
-            probes[start:start + 128] = geometry.sample(roots[start:start + 128], quats[start:start + 128])[0]
+        def sample(positions, rotations):
+            values = np.empty((length, 4, 3), np.float32)
+            for start in range(0, length, 128):
+                check()
+                values[start:start + 128] = geometry.sample(positions[start:start + 128], rotations[start:start + 128])[0]
+            return values
+
+        probes = sample(roots, quats)
 
         options = self.options
         fps = float(kwargs.get("fps", 30.0))
         floor = None if options["auto_floor"] else options["floor"]
         ranges = None if options["foot_lock"] else [[], []]
+
+        def plan_contacts(values, height):
+            return prepare_contacts(values, probabilities, fps, height, options["preset"], ranges, options["mode"])
+
+        source_probes = probes
+        plan = fitted = None
+        if self.sole_fit_strength > 0 and options["foot_lock"] and options["mode"] == "flat":
+            from .runtime_sole_alignment import fit_sole_input
+
+            plan = plan_contacts(probes, floor)
+            contact_floor = plan[4]
+
+            def evaluate(candidate):
+                values = sample(roots, candidate)
+                return values, plan_contacts(values, contact_floor)
+
+            quats, probes, plan, fitted = fit_sole_input(
+                geometry.rest[:22], roots, quats, probes, probabilities, fps, plan, evaluate,
+                strength=self.sole_fit_strength,
+            )
+            if fitted.any():
+                floor = contact_floor
+
         fixed_roots, fixed_quats, report = correct_arrays(
             geometry.rest[:22], roots, quats, probes, probabilities, fps, floor,
             preset=options["preset"], contact_ranges=ranges,
-            pelvis_offset=options["pelvis_offset"], mode=options["mode"],
+            pelvis_offset=options["pelvis_offset"], mode=options["mode"], emit=lambda *args, **kw: check(),
             foot_enabled=options["foot_lock"],
         )
         report["hand_lock"] = apply_hands(
@@ -94,13 +129,19 @@ class PostprocessPipeline:
             raise RuntimeError("RGBMocap correction returned non-finite motion")
 
         # Keep the upstream physical-sole diagnostics alongside the native IK report.
-        after = np.empty_like(probes)
-        for start in range(0, length, 128):
-            after[start:start + 128] = geometry.sample(fixed_roots[start:start + 128], fixed_quats[start:start + 128])[0]
-        active, anchors, *_ = prepare_contacts(probes, probabilities, fps, floor, options["preset"], ranges, options["mode"])
+        after = sample(fixed_roots, fixed_quats)
+        active, anchors, *_ = plan if plan is not None else plan_contacts(probes, floor)
         report.update(sole_metrics(probes, after, probabilities, active, anchors, report["segments"], fps, options["preset"], report["floor"], options["mode"]))
         if (report["full_lock_surface_error_max_m"] or 0) > .01 or report["contact_sole_penetration_over_1cm"]:
             report["warning"] = " ".join(filter(None, (report["warning"], "Some physical sole contacts remain unresolved; inspect floor height and timing.")))
+
+        if fitted is not None:
+            report["sole_fit"] = {"strength": self.sole_fit_strength, "adjusted": int(fitted.sum())}
+            if fitted.any():
+                for label, values in (("before", source_probes), ("after", after)):
+                    gap = np.abs(values[:, ::2, 1] - values[:, 1::2, 1])[fitted]
+                    report["sole_fit"][f"gap_{label}_p95_mm"] = float(np.quantile(gap, .95) * 1000)
+                report["method"] += "; level stable soles"
 
         result = dict(output)
         result["rot6d"] = rot6d.clone()
@@ -125,7 +166,10 @@ class PostprocessPipeline:
         result["method"] = report["method"]
         report["elapsed_seconds"] = time.perf_counter() - started
         self.last_report = report
-        print(f"  [RGBMocap correction] {length} frames, {report['elapsed_seconds']:.2f}s")
+        print(f"  [RGBMocap correction] {length} frames, preset={report['preset']}, floor={report['floor']:+.3f} m, "
+              f"contacts={report['contacts']}, {report['elapsed_seconds']:.2f}s")
+        if fitted is not None:
+            print(f"  [sole fit] {report['sole_fit']}")
         if report["warning"]:
             print(f"  [RGBMocap correction] {report['warning']}")
         return result

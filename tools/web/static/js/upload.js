@@ -11,7 +11,7 @@ export function initUpload(bus) {
   const pick = (f) => {
     if (!f) return;
     if (!f.type.startsWith("video/") && !VIDEO_RE.test(f.name)) {
-      setError("Please choose a video file (mp4 / mov / avi / mkv / webm).");
+      setError("请选择 MP4、MOV、AVI、MKV 或 WebM 视频。");
       return;
     }
     setError("");

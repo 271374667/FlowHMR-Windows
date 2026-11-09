@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from flowhmr.model_files import missing_model_paths, sam3d_paths
 
 # Repo root + local sam_3d_body package path
 _repo_root = osp.normpath(osp.join(osp.dirname(__file__), "..", ".."))
@@ -20,11 +21,6 @@ if _sam_repo_dir not in sys.path:
 
 from sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body
 
-
-# Checkpoint paths
-_sam_ckpt_dir = osp.join(_repo_root, "ckpts", "sam-3d-body-dinov3")
-SAM3D_CKPT_PATH = osp.join(_sam_ckpt_dir, "model.ckpt")
-SAM3D_MHR_PATH = osp.join(_sam_ckpt_dir, "assets", "mhr_model.pt")
 
 # Visualize function (module-level cache)
 _visualize_fn_cache = None
@@ -143,7 +139,7 @@ class Sam3DTokenExtractor:
         return all_token, all_out
 
     def extract_frames(self, images, boxes, cameras, *, frame_batch_size=None,
-                       use_gpu_preprocess=None) -> Tensor:
+                       use_gpu_preprocess=None, hand_boxes_out=None, hand_boxes_only=False) -> Tensor:
         """Extract body and both hand tokens without full SAM postprocessing.
 
         Defaults use sixteen video frames per batch and GPU crop preprocessing.
@@ -158,7 +154,7 @@ class Sam3DTokenExtractor:
         if len(images) != len(boxes) or len(images) != len(cameras):
             raise ValueError("Expected one box and one camera per image")
         if not images:
-            return torch.empty((0, 3072), dtype=torch.float32)
+            return torch.empty((0, 2, 4) if hand_boxes_only else (0, 3072), dtype=torch.float32)
         gpu_preprocess = self.use_gpu_preprocess if use_gpu_preprocess is None else bool(use_gpu_preprocess)
         self._body_tokens.clear()
         self._hand_tokens.clear()
@@ -168,6 +164,7 @@ class Sam3DTokenExtractor:
             tokens.append(extract_tokens(
                 self.estimator, images[start:stop], boxes[start:stop], cameras[start:stop],
                 gpu_preprocess=gpu_preprocess, merge_hands=True,
+                hand_boxes_out=hand_boxes_out, hand_boxes_only=hand_boxes_only,
             ))
         return torch.cat(tokens)
 
@@ -231,12 +228,18 @@ class Sam3DTokenExtractor:
         bbox_thr: float = 0.5,
         nms_thr: float = 0.3,
         max_frames: Optional[int] = None,
+        start_frame: int = 0,
         progress_cb: Optional[Callable[[str, int, Optional[int], str], None]] = None,
         frame_batch_size: Optional[int] = None,
         use_gpu_preprocess: Optional[bool] = None,
+        on_oom_reduce: Optional[Callable[[int], None]] = None,
+        hand_boxes_out: Optional[list] = None,
+        _hand_boxes_only: bool = False,
     ) -> Tensor:
         if inference_type != "full":
             raise ValueError("extract_video_tokens only supports inference_type='full'")
+        if use_mask and (_hand_boxes_only or hand_boxes_out is not None):
+            raise ValueError("Hand boxes require the batched SAM path")
         batch_size = self.frame_batch_size if frame_batch_size is None else frame_batch_size
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError("frame_batch_size must be a positive integer")
@@ -252,58 +255,80 @@ class Sam3DTokenExtractor:
         if not cap.isOpened():
             raise ValueError(f"cannot open video: {video_path}")
 
-        effective_max = max_frames if (max_frames is not None and max_frames > 0) else None
-        pbar_total = min(total_frames, effective_max) if effective_max is not None else total_frames
-
-        _call_progress(progress_cb, "sam", 0, pbar_total, "sam: start")
-
+        end = min(total_frames, max_frames) if max_frames is not None and max_frames > 0 else total_frames
+        pbar_total = end - start_frame
         feats: List[Tensor] = []
         t_start = time.time()
         try:
-            i = 0
-            while True:
+            if not 0 <= start_frame < end:
+                raise ValueError(f"Invalid SAM frame range: [{start_frame},{end})")
+            _call_progress(progress_cb, "sam", 0, pbar_total, "sam: start")
+            if start_frame and not cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame):
+                for _ in range(start_frame):
+                    if not cap.grab():
+                        raise ValueError(f"Cannot reach video frame {start_frame + 1}")
+            i = start_frame
+            while i < end:
                 frames = []
-                for _ in range(batch_size):
-                    if effective_max is not None and i + len(frames) >= effective_max:
-                        break
+                for _ in range(min(batch_size, end - i)):
                     ok, frame_bgr = cap.read()
                     if not ok:
                         break
                     frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
                 if not frames:
                     break
-                stop = i + len(frames)
-                if use_mask:
-                    # Keep the existing optional segmentation behavior.
-                    tokens = torch.stack([
-                        self.extract_frame(
-                            frame, bboxes=bbox_xyxy[index].reshape(1, 4).numpy(),
-                            cam_int=K_all[index].reshape(1, 3, 3), use_mask=True,
-                            bbox_thr=bbox_thr, nms_thr=nms_thr,
-                        )[0].to(torch.float32)
-                        for index, frame in enumerate(frames, i)
-                    ])
-                else:
-                    tokens = self.extract_frames(
-                        frames, bbox_xyxy[i:stop], K_all[i:stop],
-                        frame_batch_size=batch_size,
-                        use_gpu_preprocess=use_gpu_preprocess,
-                    )
-                feats.extend(tokens[:, :token_dim].unbind(0))
-                i = stop
-                _call_progress(progress_cb, "sam", i, pbar_total, "sam: running")
-                if i % 10 == 0 or i == pbar_total:
+                offset = 0
+                while offset < len(frames):
+                    count = min(batch_size, len(frames) - offset)
+                    first, stop = i + offset, i + offset + count
+                    chunk = frames[offset:offset + count]
+                    failed = False
+                    hand_boxes = [] if hand_boxes_out is not None else None
+                    try:
+                        if use_mask:
+                            tokens = torch.stack([
+                                self.extract_frame(
+                                    frame, bboxes=bbox_xyxy[index].reshape(1, 4).numpy(),
+                                    cam_int=K_all[index].reshape(1, 3, 3), use_mask=True,
+                                    bbox_thr=bbox_thr, nms_thr=nms_thr,
+                                )[0].to(torch.float32)
+                                for index, frame in enumerate(chunk, first)
+                            ])
+                        else:
+                            tokens = self.extract_frames(
+                                chunk, bbox_xyxy[first:stop], K_all[first:stop],
+                                frame_batch_size=count, use_gpu_preprocess=use_gpu_preprocess,
+                                hand_boxes_out=hand_boxes, hand_boxes_only=_hand_boxes_only,
+                            )
+                    except torch.cuda.OutOfMemoryError:
+                        if on_oom_reduce is None or count == 1:
+                            raise
+                        failed = True
+                    if failed:
+                        # Leave the exception scope first so its CUDA tensors can be released.
+                        self._body_tokens.clear()
+                        self._hand_tokens.clear()
+                        torch.cuda.empty_cache()
+                        batch_size = max(1, count // 2)
+                        on_oom_reduce(batch_size)
+                        continue
+                    feats.extend((tokens if _hand_boxes_only else tokens[:, :token_dim]).unbind(0))
+                    if hand_boxes is not None:
+                        hand_boxes_out.extend(hand_boxes)
+                    offset += count
+                    _call_progress(progress_cb, "sam", stop - start_frame, pbar_total, "sam: running")
+                i += len(frames)
+                done = i - start_frame
+                if done % 10 == 0 or done == pbar_total:
                     elapsed = time.time() - t_start
-                    fps = i / elapsed if elapsed > 0 else 0
-                    eta = (pbar_total - i) / fps if fps > 0 else 0
+                    fps = done / elapsed if elapsed > 0 else 0
+                    eta = (pbar_total - done) / fps if fps > 0 else 0
                     now_str = datetime.datetime.now().strftime("%H:%M:%S")
                     print(
-                        f"    [{now_str}] SAM extract: {i}/{pbar_total} "
-                        f"({100 * i / pbar_total:.1f}%) "
+                        f"    [{now_str}] SAM extract: {done}/{pbar_total} "
+                        f"({100 * done / pbar_total:.1f}%) "
                         f"| {elapsed:.1f}s elapsed, {fps:.2f} fps, ETA {eta:.1f}s"
                     )
-                if effective_max is not None and i >= effective_max:
-                    break
         finally:
             cap.release()
             _call_progress(progress_cb, "sam", len(feats), pbar_total, "sam: done")
@@ -311,6 +336,30 @@ class Sam3DTokenExtractor:
         if len(feats) == 0:
             raise ValueError(f"no frames extracted from video: {video_path}")
         return torch.stack(feats, dim=0)
+
+    def extract_video_hand_boxes(self, video_path, **kwargs) -> np.ndarray:
+        """Recover original-frame left/right boxes without recomputing hand tokens."""
+        return self.extract_video_tokens(video_path, _hand_boxes_only=True, **kwargs).numpy()
+
+    @torch.no_grad()
+    def scene_keypoints(self, image, boxes, intrinsics, joint_ids):
+        """Observe several tracks in one source frame, in the same camera coordinates."""
+        from sam_3d_body.data.utils.prepare_batch import prepare_batch
+
+        device = torch.device(self.estimator.device)
+        camera = torch.as_tensor(intrinsics, dtype=torch.float32).reshape(1, 3, 3)
+        batch = prepare_batch(image, self.estimator.transform, boxes, cam_int=camera)
+        batch = {key: value.to(device) for key, value in batch.items() if isinstance(value, Tensor)}
+        model = self.estimator.model
+        try:
+            with torch.cuda.device(device):
+                model._initialize_batch(batch)
+                output = model.forward_step(batch, decoder_type="body")["mhr"]
+                return (output["pred_keypoints_3d"][:, joint_ids]
+                        + output["pred_cam_t"][:, None, :]).float().cpu().numpy()
+        finally:
+            self._body_tokens.clear()
+            self._hand_tokens.clear()
 
     # Debug: visualize SAM outputs to video
     def debug_sam_video(
@@ -446,14 +495,15 @@ def build_sam3d_extractor(device: torch.device, *, frame_batch_size=16,
     from .sam_compile import enable_sam_compile, resolve_sam_compile
 
     compile_backbone = resolve_sam_compile(device, use_compile)
-    if not osp.exists(SAM3D_CKPT_PATH):
-        raise FileNotFoundError(f"SAM3D checkpoint not found: {SAM3D_CKPT_PATH}")
-    if not osp.exists(SAM3D_MHR_PATH):
-        raise FileNotFoundError(f"SAM3D MHR checkpoint not found: {SAM3D_MHR_PATH}")
+    paths = sam3d_paths()
+    missing = missing_model_paths(paths)
+    if missing:
+        raise FileNotFoundError("SAM 3D Body 缺少文件：" + ", ".join(missing))
+    checkpoint, _, mhr = paths
 
     sam_model, sam_cfg = load_sam_3d_body(
-        checkpoint_path=SAM3D_CKPT_PATH,
-        mhr_path=SAM3D_MHR_PATH,
+        checkpoint_path=str(checkpoint),
+        mhr_path=str(mhr),
         device=device,
     )
     _maybe_convert_backbone_to_fp16(sam_model, device)
