@@ -7,6 +7,14 @@
 <a href="https://huggingface.co/fafsaf1/flowhmr-0.46B"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue" alt="Hugging Face Model"></a>
 </div>
 
+## Blender 重定向插件：FlowHMR 2 MMR
+
+**[下载 FlowHMR 2 MMR v1.3.1（ZIP）](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/download/windows-v0.1.0/FlowHMR_2_MMR_v1.3.1.zip)** · Blender 3.6 及以上 · 作者：小二, GPT
+
+把 FlowHMR 导出的 FBX 动作重定向到 MMR 控制骨架。支持在同一场景预览和烘焙多人动作，保留各自的入场时间和相对站位。
+
+在 Blender 的 **编辑 → 偏好设置 → 插件** 中直接安装 ZIP 并启用。回到 3D 视图按 **N**，打开 **FlowHMR 2 MMR** 页签。需要预先用 MMR 生成目标控制骨架，详见 [发布页安装说明](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/tag/windows-v0.1.0)。
+
 ## Windows 桌面版
 
 这是基于 [FlowHMR 上游项目](https://github.com/flowhmr/flowhmr) 的独立 Windows 桌面发行版。原项目的论文、署名和 [许可证](LICENSE) 保留于本仓库。
