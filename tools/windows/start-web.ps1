@@ -1,8 +1,16 @@
-param([ValidateRange(1, 65535)][int]$Port = 60550, [Alias('NoBrowser')][switch]$ServerOnly)
+param(
+    [ValidateRange(1, 65535)][int]$Port = 60550,
+    [Alias('NoBrowser')][switch]$ServerOnly,
+    [ValidatePattern('^Local\\FlowHMR-backend-[0-9a-f]{32}$')][string]$DesktopJobName
+)
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location -LiteralPath $projectRoot
 . (Join-Path $PSScriptRoot 'desktop-runtime.ps1')
+if ($DesktopJobName) {
+    if (-not $ServerOnly) { throw 'A desktop job can only start the server.' }
+    Join-FlowHMRDesktopJob $DesktopJobName
+}
 $pythonExe = Get-FlowHMRConsoleRuntime $projectRoot
 if (-not $ServerOnly) {
     $launcher = Join-Path $projectRoot 'FlowHMR.exe'

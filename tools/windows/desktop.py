@@ -13,6 +13,7 @@ import subprocess
 import threading
 from urllib.parse import urlsplit
 from urllib.request import urlopen
+from uuid import uuid4
 
 import webview
 
@@ -20,6 +21,89 @@ import webview
 ROOT = Path(__file__).resolve().parents[2]
 TITLE = "FlowHMR"
 FBX_INSTALL_LOCK = threading.Lock()
+
+
+class _JobBasicLimits(ctypes.Structure):
+    _fields_ = [
+        ("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
+        ("flags", wintypes.DWORD), ("min_working_set", ctypes.c_size_t),
+        ("max_working_set", ctypes.c_size_t), ("active_processes", wintypes.DWORD),
+        ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+        ("scheduling", wintypes.DWORD),
+    ]
+
+
+class _JobExtendedLimits(ctypes.Structure):
+    _fields_ = [
+        ("basic", _JobBasicLimits), ("io_counters", ctypes.c_uint64 * 6),
+        ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+        ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t),
+    ]
+
+
+class DesktopBackend:
+    """Own the inference processes launched by this window, including their workers."""
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.closed = threading.Event()
+        self._lock = threading.Lock()
+        self.name = f"Local\\FlowHMR-backend-{uuid4().hex}"
+        kernel.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+        )
+        kernel.SetInformationJobObject.restype = wintypes.BOOL
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        handle = kernel.CreateJobObjectW(None, self.name)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = _JobExtendedLimits()
+        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            kernel.CloseHandle(handle)
+            raise error
+        self._handle = handle
+
+    def close(self):
+        with self._lock:
+            self.closed.set()
+            if self._handle and self.kernel.CloseHandle(self._handle):
+                self._handle = None
+                logging.info("Closed desktop backend process group")
+            elif self._handle:
+                logging.error("Could not close desktop backend job: %s", ctypes.WinError(ctypes.get_last_error()))
+
+    def run_helper(self, args, *, timeout, **options):
+        # These helpers do not launch the server. The starter joins before spawning it.
+        with self._lock:
+            if self.closed.is_set():
+                return
+            process = subprocess.Popen(args, creationflags=subprocess.CREATE_NO_WINDOW, **options)
+            child = self.kernel.OpenProcess(0x0101, False, process.pid)  # SET_QUOTA | TERMINATE
+            try:
+                if not child or not self.kernel.AssignProcessToJobObject(self._handle, child):
+                    error = ctypes.WinError(ctypes.get_last_error())
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                        raise error
+            finally:
+                if child:
+                    self.kernel.CloseHandle(child)
+        try:
+            code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+        if code and not self.closed.is_set():
+            raise subprocess.CalledProcessError(code, args)
 
 
 def status_page(heading, detail):
@@ -66,7 +150,7 @@ def open_runtime_folder():
     os.startfile(directory)
 
 
-def prepare_fbx():
+def prepare_fbx(backend):
     runtime = ROOT / "runtime"
     python = runtime / "python.exe"
     if not python.is_file() or (runtime / "Lib/site-packages/fbx.pyd").is_file():
@@ -74,14 +158,15 @@ def prepare_fbx():
     with FBX_INSTALL_LOCK:
         try:
             with (ROOT / "logs/fbx-install.log").open("ab") as log:
-                subprocess.run([str(python), "-I", "-B", str(ROOT / "tools/windows/install_fbx.py")],
-                               cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
-                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=25, check=True)
+                backend.run_helper([str(python), "-I", "-B", str(ROOT / "tools/windows/install_fbx.py")],
+                                   cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, timeout=25)
         except (OSError, subprocess.SubprocessError):
             logging.warning("Optional FBX setup failed; running FlowHMR without FBX export", exc_info=True)
 
 
-def connect(window, port):
+def connect(window, port, backend):
+    if backend.closed.is_set():
+        return
     script = ROOT / "tools/windows/start-web.ps1"
     launcher_log = ROOT / "logs/desktop-launcher.log"
     try:
@@ -91,40 +176,48 @@ def connect(window, port):
         with launcher_log.open("ab") as log:
             result = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
-                 "-ServerOnly", "-Port", str(port)],
+                 "-ServerOnly", "-Port", str(port), "-DesktopJobName", backend.name],
                 cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW, timeout=310,
             )
+        if backend.closed.is_set():
+            return
         if result.returncode:
             raise RuntimeError(f"后端启动失败（{result.returncode}），详情见 logs/desktop-launcher.log。")
         window.load_url(f"http://127.0.0.1:{port}/")
-        threading.Thread(target=prepare_fbx, name="flowhmr-fbx-setup", daemon=True).start()
+        threading.Thread(target=prepare_fbx, args=(backend,), name="flowhmr-fbx-setup", daemon=True).start()
         logging.info("Loaded local FlowHMR at port %d", port)
     except Exception as error:
+        if backend.closed.is_set():
+            return
         logging.exception("Failed to connect to FlowHMR")
         window.load_html(status_page("FlowHMR 启动失败", f"{error} 请查看 logs/desktop.log。"))
 
 
-def expose_runtime_restart(window, port):
+def expose_runtime_restart(window, port, backend):
     restart_lock = threading.Lock()
     url = f"http://127.0.0.1:{port}"
 
     def reload_backend():
         try:
+            if backend.closed.is_set():
+                return
             window.load_html(status_page("正在切换运行环境", "推理服务重启后会自动回到 FlowHMR。"))
             with (ROOT / "logs/desktop-launcher.log").open("ab") as log:
-                subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                                str(ROOT / "tools/windows/stop-web.ps1")], cwd=ROOT, stdout=log,
-                               stderr=subprocess.STDOUT, timeout=25, check=True,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
-            connect(window, port)
+                backend.run_helper(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                    str(ROOT / "tools/windows/stop-web.ps1")], cwd=ROOT, stdout=log,
+                                   stderr=subprocess.STDOUT, timeout=25)
+            connect(window, port, backend)
         except (OSError, subprocess.SubprocessError):
-            logging.exception("Could not restart FlowHMR for runtime switch")
-            window.load_url(url + "/")
+            if not backend.closed.is_set():
+                logging.exception("Could not restart FlowHMR for runtime switch")
+                window.load_url(url + "/")
         finally:
             restart_lock.release()
 
     def restart_runtime():
+        if backend.closed.is_set():
+            return False
         current = urlsplit(window.get_current_url() or "")
         if f"{current.scheme}://{current.netloc}" != url:
             return False
@@ -133,7 +226,7 @@ def expose_runtime_restart(window, port):
                 pending = json.load(response).get("pending_restart", False)
         except (OSError, ValueError):
             return False
-        if not pending or not restart_lock.acquire(blocking=False):
+        if not pending or backend.closed.is_set() or not restart_lock.acquire(blocking=False):
             return False
         threading.Thread(target=reload_backend, name="flowhmr-runtime-restart", daemon=True).start()
         return True
@@ -188,10 +281,12 @@ def main():
     kernel.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
     kernel.CreateMutexW.restype = wintypes.HANDLE
     kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.CloseHandle.restype = wintypes.BOOL
     instance = kernel.CreateMutexW(None, False, f"Local\\FlowHMR-desktop-{port}")
     if not instance:
         raise ctypes.WinError(ctypes.get_last_error())
     already_open = ctypes.get_last_error() == 183
+    backend = None
     try:
         if already_open:
             user32 = ctypes.windll.user32
@@ -210,6 +305,7 @@ def main():
         logging.basicConfig(filename=log_dir / "desktop.log", encoding="utf-8", level=logging.INFO,
                             format="%(asctime)s %(message)s")
         logging.info("Desktop startup: inherited console=%s", inherited_console)
+        backend = DesktopBackend(kernel)
         webview.settings["ALLOW_DOWNLOADS"] = True
         webview.settings["ALLOW_FILE_URLS"] = False
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
@@ -223,13 +319,16 @@ def main():
         )
         window.expose(open_models_folder)
         window.expose(open_runtime_folder)
-        expose_runtime_restart(window, port)
+        expose_runtime_restart(window, port, backend)
         window.events.before_show += configure_downloads
-        window.events.shown += lambda: threading.Thread(target=connect, args=(window, port), daemon=True).start()
+        window.events.shown += lambda: threading.Thread(target=connect, args=(window, port, backend), daemon=True).start()
+        window.events.closed += backend.close
         webview.start(gui="edgechromium", private_mode=False,
                       storage_path=os.fspath(ROOT / ".cache/webview2"),
                       icon=os.fspath(ROOT / "assets/flowhmr.ico"))
     finally:
+        if backend is not None:
+            backend.close()
         kernel.CloseHandle(instance)
 
 

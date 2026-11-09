@@ -18,3 +18,40 @@ function Get-FlowHMRConsoleRuntime([string]$ProjectRoot) {
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'FlowHMR Python runtime was not found.' }
     return $python
 }
+
+function Join-FlowHMRDesktopJob([string]$Name) {
+    # Join before launching Python so the interpreter and all its children inherit the job.
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class FlowHMRDesktopJob
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static void Join(string name)
+    {
+        IntPtr job = OpenJobObject(1, false, name); // JOB_OBJECT_ASSIGN_PROCESS
+        if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try
+        {
+            if (!AssignProcessToJobObject(job, GetCurrentProcess()))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        finally { CloseHandle(job); }
+    }
+}
+'@
+    [FlowHMRDesktopJob]::Join($Name)
+}
