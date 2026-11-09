@@ -13,6 +13,8 @@ MODELSCOPE = "https://www.modelscope.cn"
 YOLOX_URL = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_l.pth"
 REGRESSOR_URL = "https://raw.githubusercontent.com/zju3dv/GVHMR/main/hmr4d/utils/body_model/smpl_neutral_J_regressor.pt"
 MANO_URL = "https://mano.is.tue.mpg.de/download.php"
+SMPLH_DOWNLOAD = ("Extended SMPL+H model", "smplh.tar.xz")
+MANO_DOWNLOAD = ("Models & Code", f"{files.MANO_BUNDLE}.zip")
 HAMER_PROJECT_URL = "https://github.com/geopavlakos/hamer#demo"
 HAMER_DEMO_URL = "https://drive.google.com/uc?id=1mv7CUAnm73oKsEEG1xE3xH2C_oqcFSzT"
 HAMER_ARCHIVE_URL = "https://www.cs.utexas.edu/~pavlakos/hamer/data/hamer_demo_data.tar.gz"
@@ -62,7 +64,7 @@ PUBLIC_ASSETS = {
     "yolox": (Asset(files.YOLOX, 434357141, "1e6b7fa6240375370b2a8a8eab9066b3cdd43fd1d0bfa8d2027fd3a51def2917", (YOLOX_URL,)),),
     "sam": _perception_assets[:3],
     "vggt": _perception_assets[3:],
-    "smplh": (Asset(files.JOINT_REGRESSOR, 662187, "70e3213bd30fe8d8ce37b54675282745e406f915a51511a003aeff99b6da04cf", (REGRESSOR_URL,)),),
+    "joint-regressor": (Asset(files.JOINT_REGRESSOR, 662187, "70e3213bd30fe8d8ce37b54675282745e406f915a51511a003aeff99b6da04cf", (REGRESSOR_URL,)),),
 }
 
 HAMER_CODE = Asset(".downloads/hamer-source.zip", 2314326, HAMER_SOURCE_SHA256, (HAMER_SOURCE_URL,))

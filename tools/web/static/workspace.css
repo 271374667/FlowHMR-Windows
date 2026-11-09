@@ -170,10 +170,14 @@ body { height: 100dvh; }
   display: flex; justify-content: space-between; align-items: center; gap: 8px;
   padding: 7px 5px; font-size: 12px;
 }
-.model-badge { padding: 2px 6px; border-radius: 3px; font-size: 11px; color: var(--model-warning); background: #bf7c3020; }
+.model-name { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.model-role { color: var(--muted); font-size: 11px; }
+.model-badge { flex-shrink: 0; padding: 2px 6px; border-radius: 3px; font-size: 11px; color: var(--model-warning); background: #bf7c3020; }
 .model-badge[data-state="ready"] { color: var(--model-ready); background: #36a37720; }
 .model-install { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 0 5px 6px; color: var(--muted); font-size: 11px; }
 .model-install code { overflow-wrap: anywhere; user-select: text; }
+.model-archive strong, .model-archive code { color: var(--text); }
+.model-missing { gap: 3px 8px; }
 .model-install a { color: var(--text); text-decoration: underline; text-underline-offset: 2px; }
 .model-install a:hover { color: var(--model-ready); }
 .model-issue { margin: 0 5px 6px; font-size: 11px; color: var(--model-warning); }

@@ -110,7 +110,10 @@ def main():
             fetch(sources.modelscope_file(repo, name), target, size, sha)
     body = files.resolve_model(files.SMPLH_FILES["neutral"])
     if not files.file_present(body):
-        print("SMPL-H requires a MANO account download (smplh_amass_neutral).\nPlace neutral/model.npz at: " + str(body), flush=True)
+        entry, archive = sources.SMPLH_DOWNLOAD
+        print(f"SMPL-H: sign in at {sources.MANO_URL} and select '{entry}' ({archive}).\n"
+              f"Extract directly to: {files.MODEL_ROOT / files.SMPLH_FOLDER}\n"
+              f"Expected file: {body}", flush=True)
     if failures:
         print("Unfinished downloads: " + ", ".join(failures), flush=True)
         return 1

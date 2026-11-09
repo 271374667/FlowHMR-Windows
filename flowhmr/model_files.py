@@ -16,10 +16,11 @@ SAM3D_FILES = (
     "sam-3d-body-dinov3/assets/mhr_model.pt",
 )
 VGGT = "vggt-omega/vggt_omega_1b_512.pt"
+SMPLH_FOLDER = "body_models/smplh"
 MANO_BUNDLE = "mano_v1_2"
 MANO_FILES = tuple(f"{MANO_BUNDLE}/models/MANO_{side}.pkl" for side in ("LEFT", "RIGHT"))
 SMPLH_FILES = {
-    "neutral": "body_models/smplh/neutral/model.npz",
+    "neutral": f"{SMPLH_FOLDER}/neutral/model.npz",
     "female": f"{MANO_BUNDLE}/models/SMPLH_female.pkl",
     "male": f"{MANO_BUNDLE}/models/SMPLH_male.pkl",
 }

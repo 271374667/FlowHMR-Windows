@@ -54,8 +54,8 @@ fixed-camera mode skips VGGT inference.
 
 Download the SMPL-family models after registering:
 
-- **V2M**: SMPL-H neutral from [MANO](https://mano.is.tue.mpg.de/) (AMASS `smplh_amass_neutral`).
-- For the desktop body templates and hand refinement, place the official `mano_v1_2` directory intact under `models/`.
+- **V2M**: Sign in to the [MANO downloads page](https://mano.is.tue.mpg.de/download.php), choose **Extended SMPL+H model** (AMASS, `smplh.tar.xz`), and extract it into `models/body_models/smplh/`. The required file is `models/body_models/smplh/neutral/model.npz`.
+- **Optional desktop features**: On the same page, choose **Models & Code** (`mano_v1_2.zip`) and extract it into `models/` for hand refinement and alternative body templates. Keep the `mano_v1_2/models/` directory from the archive.
 - **Full pipeline**: also [SMPL](https://smpl.is.tue.mpg.de/) v1.1.0 under `data/smpl/`, read by
   `smpl_sim`. Rename `basicmodel_{neutral,m,f}_lbs_10_207_0_v1.1.0.pkl` to
   `SMPL_{NEUTRAL,MALE,FEMALE}.pkl`. SMPL-X is not needed (the simulator uses the `smpl_humanoid` robot).

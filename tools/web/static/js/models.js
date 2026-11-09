@@ -25,11 +25,21 @@ export function initModelDialog(refreshInventory) {
       const heading = el("div", "model-row");
       const badge = el("span", "model-badge", LABELS[item.status]);
       badge.dataset.state = item.status;
-      heading.append(el("strong", "", item.name), badge);
+      const name = el("span", "model-name");
+      name.append(el("strong", "", item.name), el("span", "model-role", item.required ? "必需" : "可选"));
+      heading.append(name, badge);
       row.append(heading);
       if (item.status !== "ready") {
+        if (item.archive) {
+          const source = el("div", "model-install model-archive");
+          source.append(el("span", "", "官网下载项"), el("strong", "", item.archive.entry),
+            el("code", "", item.archive.name));
+          row.append(source);
+        }
         const help = el("div", "model-install");
-        if (item.status === "missing") help.append(el("code", "", item.folder));
+        if (item.status === "missing") {
+          help.append(el("span", "", item.archive ? "解压到" : "放入"), el("code", "", item.folder));
+        }
         for (const { label, url } of item.links) {
           const link = el("a", "", label);
           link.href = url;
@@ -38,6 +48,11 @@ export function initModelDialog(refreshInventory) {
           help.append(link);
         }
         row.append(help);
+        if (item.missing?.length) {
+          const missing = el("div", "model-install model-missing");
+          missing.append(el("span", "", "缺少"), ...item.missing.map((file) => el("code", "", file)));
+          row.append(missing);
+        }
         if (item.issue) row.append(el("p", "model-issue", item.issue));
       }
       return row;

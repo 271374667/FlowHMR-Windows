@@ -42,9 +42,10 @@ models/body_models/
 └── smpl_neutral_J_regressor.pt
 ```
 
-The SMPL-H neutral model comes from the AMASS `smplh_amass_neutral` release
-([SMPL-H / MANO](https://mano.is.tue.mpg.de/)). It is used by the SMPL skeleton
-and mesh implementations. The joint regressor is a public
+For the SMPL-H neutral model, select **Extended SMPL+H model** (AMASS,
+`smplh.tar.xz`) on the [MANO downloads page](https://mano.is.tue.mpg.de/download.php)
+and extract it into `models/body_models/smplh/`. It is used by the SMPL skeleton
+and mesh implementations. The joint regressor is a separate public
 [GVHMR asset](https://raw.githubusercontent.com/zju3dv/GVHMR/main/hmr4d/utils/body_model/smpl_neutral_J_regressor.pt).
 
 **PHC simulation:**
