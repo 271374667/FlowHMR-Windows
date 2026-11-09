@@ -1,4 +1,4 @@
-"""Fetch the upstream Windows FBX binding directly into the portable environment."""
+"""Validate the pinned Windows FBX binding; optionally install it for source builds."""
 
 from hashlib import sha256
 from io import BytesIO
@@ -14,20 +14,28 @@ WHEEL_NAME = "fbxsdkpy-2020.1.post2-cp310-none-win_amd64.whl"
 WHEEL_URL = f"https://gitlab.inria.fr/api/v4/projects/18692/packages/pypi/files/{WHEEL_SHA256}/{WHEEL_NAME}"
 
 
+def binding_from_wheel(wheel: bytes) -> bytes:
+    if sha256(wheel).hexdigest() != WHEEL_SHA256:
+        raise ValueError("Upstream FBX wheel SHA-256 did not match")
+    with ZipFile(BytesIO(wheel)) as archive:
+        binding = archive.read("fbx.pyd")
+    if not binding.startswith(b"MZ"):
+        raise ValueError("The FBX wheel does not contain a Windows runtime binding")
+    return binding
+
+
 def install_fbx():
     target = Path(sys.prefix) / "Lib/site-packages"
     if (target / "fbx.pyd").is_file():
         return
     with urlopen(WHEEL_URL, timeout=15) as response:
         wheel = response.read(16 * 1024 * 1024 + 1)
-    if sha256(wheel).hexdigest() != WHEEL_SHA256:
-        raise ValueError("Upstream FBX wheel SHA-256 did not match")
+    binding = binding_from_wheel(wheel)
     target.mkdir(parents=True, exist_ok=True)
-    with ZipFile(BytesIO(wheel)) as archive, tempfile.TemporaryDirectory(prefix="fbx-", dir=target) as temporary:
-        for name in ("FbxCommon.py", "fbx.pyd"):
-            path = Path(temporary) / name
-            path.write_bytes(archive.read(name))
-            path.replace(target / name)
+    with tempfile.TemporaryDirectory(prefix="fbx-", dir=target) as temporary:
+        path = Path(temporary) / "fbx.pyd"
+        path.write_bytes(binding)
+        path.replace(target / path.name)
 
 
 if __name__ == "__main__":

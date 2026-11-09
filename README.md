@@ -11,7 +11,7 @@
 
 这是基于 [FlowHMR 上游项目](https://github.com/flowhmr/flowhmr) 的独立 Windows 桌面发行版。原项目的论文、署名和 [许可证](LICENSE) 保留于本仓库。
 
-下载最新版 [FlowHMR-Windows.zip](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/latest/download/FlowHMR-Windows.zip)，解压后双击 `FlowHMR.exe`。基础包已带 Python 和界面组件。生成前从右上角 **运行环境** 下载并启用一个 CUDA 版本，再在 **模型** 中下载公开模型、补齐官方 SMPL-H / MANO 文件。
+下载最新版 [FlowHMR-Windows.zip](https://github.com/xiaoerofficial021-collab/FlowHMR-Windows/releases/latest/download/FlowHMR-Windows.zip)，解压后双击 `FlowHMR.exe`。基础包自带 Python、界面和 FBX 导出组件。生成前从右上角 **运行环境** 下载并启用一个 CUDA 版本，再在 **模型** 中下载公开模型、补齐官方 SMPL-H / MANO 文件。
 
 支持多人选取与同步预览、原声播放、手指精修、接触修正和多人 FBX 导出。模型在首次运行生成时才加载。见 [Windows 使用与源码构建说明](docs/windows.md) 和 [模型目录说明](models/README.md)。
 

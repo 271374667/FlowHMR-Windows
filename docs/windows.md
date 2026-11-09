@@ -7,7 +7,7 @@
 3. 点击右上角 **运行环境**，下载并启用 CUDA 12.6、12.8 或 12.9。RTX 50 系列推荐 12.8。下载支持续传，安装会校验文件和 GPU 运算。版本分别存入 `runtime/environments`，启用时重启推理服务。
 4. 点击右上角 **模型** → **下载缺失模型**。公开模型自动存入 `models`。需要注册获取的 SMPL-H / MANO 按 [模型说明](../models/README.md) 放好。开始生成时才会加载推理模型。
 
-首次启动会在后台尝试从上游下载 FBX 导出组件。已安装运行环境和模型后，可离线生成、预览和导出 NPZ；恢复网络后重开可重试 FBX 组件下载。程序设置、日志和任务历史留在解包目录。可双击 `check-install.cmd` 检查环境和模型。
+Windows 便携包自带 FBX 导出组件。安装运行环境和模型后，可离线生成、预览和导出 FBX 或 NPZ。程序设置、日志和任务历史留在解包目录。可双击 `check-install.cmd` 检查环境和模型。
 
 ## 从源码运行
 
@@ -28,6 +28,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\build-exe.ps1
 ## 打包
 
 在已验证的 Python 3.10 x64 / cu128 环境下，准备微软签名的 [WebView2 x64 离线安装程序](https://developer.microsoft.com/microsoft-edge/webview2/#download-section) 和 [Visual C++ x64 可再发行组件](https://aka.ms/vs/17/release/vc_redist.x64.exe)，使用下列名称保存：`MicrosoftEdgeWebView2RuntimeInstallerX64.exe`、`vc_redist.x64.exe`。还需要固定版本的 HaMeR 和 DINOv3 推理代码。打包只带代码和环境，不带模型权重。
+
+将 `tools/windows/install_fbx.py` 指定的 `fbxsdkpy` wheel 放入同一先决条件目录，文件名保持为 `fbxsdkpy-2020.1.post2-cp310-none-win_amd64.whl`。打包会校验 SHA-256，并只提取运行所需的 `fbx.pyd`。
 
 ```powershell
 git clone https://github.com/facebookresearch/dinov3.git .cache\dinov3

@@ -20,7 +20,6 @@ import webview
 
 ROOT = Path(__file__).resolve().parents[2]
 TITLE = "FlowHMR"
-FBX_INSTALL_LOCK = threading.Lock()
 
 
 class _JobBasicLimits(ctypes.Structure):
@@ -150,20 +149,6 @@ def open_runtime_folder():
     os.startfile(directory)
 
 
-def prepare_fbx(backend):
-    runtime = ROOT / "runtime"
-    python = runtime / "python.exe"
-    if not python.is_file() or (runtime / "Lib/site-packages/fbx.pyd").is_file():
-        return
-    with FBX_INSTALL_LOCK:
-        try:
-            with (ROOT / "logs/fbx-install.log").open("ab") as log:
-                backend.run_helper([str(python), "-I", "-B", str(ROOT / "tools/windows/install_fbx.py")],
-                                   cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, timeout=25)
-        except (OSError, subprocess.SubprocessError):
-            logging.warning("Optional FBX setup failed; running FlowHMR without FBX export", exc_info=True)
-
-
 def connect(window, port, backend):
     if backend.closed.is_set():
         return
@@ -185,7 +170,6 @@ def connect(window, port, backend):
         if result.returncode:
             raise RuntimeError(f"后端启动失败（{result.returncode}），详情见 logs/desktop-launcher.log。")
         window.load_url(f"http://127.0.0.1:{port}/")
-        threading.Thread(target=prepare_fbx, args=(backend,), name="flowhmr-fbx-setup", daemon=True).start()
         logging.info("Loaded local FlowHMR at port %d", port)
     except Exception as error:
         if backend.closed.is_set():

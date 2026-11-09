@@ -12,6 +12,11 @@ import sys
 import tempfile
 import zipfile
 
+if __package__:
+    from .install_fbx import WHEEL_NAME as FBX_WHEEL_NAME, binding_from_wheel
+else:
+    from install_fbx import WHEEL_NAME as FBX_WHEEL_NAME, binding_from_wheel
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SUBMODULES = ("YOLOX", "sam-3d-body", "vggt-omega")
@@ -73,6 +78,8 @@ def copy_runtime(target, prerequisites, *, bundle_cuda=False):
         raise RuntimeError("Build from the tested Windows Python 3.10 x64 cu128 environment.")
     base = Path(sys.base_prefix).resolve()
     site = Path(sys.prefix) / "Lib/site-packages"
+    # Always stage the known x64 runtime from the verified build input.
+    fbx_binding = binding_from_wheel((prerequisites / FBX_WHEEL_NAME).read_bytes())
 
     def base_ignore(directory, names):
         relative = Path(directory).relative_to(base)
@@ -91,7 +98,7 @@ def copy_runtime(target, prerequisites, *, bundle_cuda=False):
             ignored.update(name for name in names if name.startswith(("__editable__", "_virtualenv", "fbxsdkpy-")))
             ignored.update(name for name in names if name in {"av", "av.libs"} or name.startswith("av-"))
             ignored.update(name for name in names if name.endswith(".whl"))  # Leftover build downloads, not installed packages.
-            # The Autodesk binding is obtained directly from its upstream package host on first launch.
+            # Use only the verified release input, never the developer's installed binding or SDK samples.
             ignored.update({"fbx.pyd", "FbxCommon.py"})
             ignored.update(name for name in names if name == "cmake" or name.startswith("cmake-"))
             if not bundle_cuda:
@@ -105,8 +112,10 @@ def copy_runtime(target, prerequisites, *, bundle_cuda=False):
 
     print("Copying Python and desktop dependencies…", flush=True)
     shutil.copytree(base, target, ignore=base_ignore)
-    shutil.copytree(site, target / "Lib/site-packages", ignore=site_ignore)
-    (target / "Lib/site-packages/flowhmr_yolox.pth").write_text("../../../third_party/YOLOX\n", encoding="ascii")
+    target_site = target / "Lib/site-packages"
+    shutil.copytree(site, target_site, ignore=site_ignore)
+    (target_site / "fbx.pyd").write_bytes(fbx_binding)
+    (target_site / "flowhmr_yolox.pth").write_text("../../../third_party/YOLOX\n", encoding="ascii")
     prereq_dir = target / "prerequisites"
     prereq_dir.mkdir()
     for name in PREREQUISITES:
