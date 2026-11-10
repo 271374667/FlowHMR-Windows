@@ -80,8 +80,10 @@ estimation.
 
 For long videos or limited GPU memory, increase **VGGT stride** (e.g. `10` or `30`)
 so camera estimation processes fewer frames and interpolates in between. In
-automatic moving-camera mode, FlowHMR adapts the resolution and sampling to
-available GPU memory. Manual mode keeps the requested sampling interval.
+automatic moving-camera mode, FlowHMR tries to keep the standard 512 resolution
+and sample positions within the available GPU memory. It lowers the resolution
+or samples fewer frames when needed. Manual mode keeps the requested sampling
+interval.
 
 Optional acceleration is configured before starting the service:
 

@@ -42,6 +42,7 @@ class VGGTCameraResult:
 _VGGT_MODEL_CACHE: dict[tuple[str, str, bool], Any] = {}
 _MIB = 1024 ** 2
 _GIB = 1024 ** 3
+_CAMERA_QUALITY_REVISION = 2
 
 
 def camera_intervals(frames: int, requested: int) -> tuple[int, ...]:
@@ -54,11 +55,14 @@ def camera_intervals(frames: int, requested: int) -> tuple[int, ...]:
                                for count in (64, 32, 16)))
 
 
-def _read_camera_cache(path, frame_range, expected_len, intervals):
+def _read_camera_cache(path, frame_range, expected_len, intervals, *, upgrade_compact=False):
     if not path or not osp.isfile(path):
         return None
     try:
         with np.load(path, allow_pickle=False) as data:
+            if (upgrade_compact and str(data.get("camera_profile", "full")) in ("low_vram", "cpu")
+                    and int(data.get("camera_quality_revision", 0)) != _CAMERA_QUALITY_REVISION):
+                return None
             rt = data["RT_vggt"] if "RT_vggt" in data.files else data["camera_RT"]
             intrinsics = data["K"]
             interval = int(data["camera_sampling_interval"]) if "camera_sampling_interval" in data.files else 1
@@ -98,6 +102,12 @@ def _camera_attempts(frames, requested, device, budget):
         return
     if budget >= 8 * _GIB:
         yield device, full, 512, False
+    # First keep the regular resolution and sample positions. Estimate the
+    # room needed for activations, then let the worker's CUDA limit decide.
+    if budget >= max(3584, 3000 + 18 * _sample_count(frames, full)) * _MIB:
+        yield device, full, 512, True
+    if medium != full and budget >= max(3584, 3000 + 18 * _sample_count(frames, medium)) * _MIB:
+        yield device, medium, 512, True
     if budget >= 4608 * _MIB:
         yield device, full, 384, True
     if budget >= 3 * _GIB:
@@ -153,7 +163,7 @@ def extract_vggt_camera_isolated(video_path, *, output_npz, frame_range, expecte
                                  device, frame_interval, cancel_check, on_progress, release_cuda=nullcontext):
     """Run the expensive camera forward in a cancellable process with a VRAM budget."""
     intervals = camera_intervals(expected_len, frame_interval)
-    cached = _read_camera_cache(output_npz, frame_range, expected_len, intervals)
+    cached = _read_camera_cache(output_npz, frame_range, expected_len, intervals, upgrade_compact=True)
     if cached is not None:
         print(f"  [vggt] skip cached camera: {output_npz}", flush=True)
         on_progress("已复用相机估计")
@@ -330,33 +340,19 @@ def _load_vggt_model(checkpoint_path: str, device: torch.device, compact: bool) 
     encoder.cached_layer_indices = {encoder.depth - 1}
     if compact and device.type == "cuda":
         dtype = _vggt_dtype(device)
-        # Keep camera regression and positional constants in FP32. Moving the
-        # encoder in its inference dtype avoids holding two copies on the GPU.
-        float_buffers = [(module, name, getattr(module, name)) for module, name in (
-            (encoder, "_resnet_mean"), (encoder, "_resnet_std"),
-            (encoder.rope_embed, "periods"), (encoder.patch_embed.rope_embed, "periods"),
-        )]
-        float_scales = []
-        if dtype == torch.float16:
-            # DINOv3's residual scale multiplication can exceed FP16 range
-            # even when its inputs are finite. Leave these small vectors in FP32.
-            from vggt_omega.models.layers import LayerScale
-
-            float_scales = [(module, module.gamma.detach()) for module in encoder.modules()
-                            if isinstance(module, LayerScale)]
-        encoder.to(device=device, dtype=dtype)
-        for module, name, buffer in float_buffers:
-            setattr(module, name, buffer.to(device))
-        for module, scale in float_scales:
-            module.gamma = torch.nn.Parameter(scale.to(device), requires_grad=False)
-        model.camera_head.to(device)
+        # Only store the layers that autocast already runs in the lower dtype
+        # that way. Keep normalization, residual scales and tokens in FP32.
+        for module in encoder.modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                module.to(device=device, dtype=dtype)
+        encoder.to(device)
     else:
         model.to(device)
     _VGGT_MODEL_CACHE[key] = model
     return model
 
 
-def _predict_camera(model, images, device):
+def _predict_camera(model, images, device, *, compact=False):
     dtype = _vggt_dtype(device) if device.type == "cuda" else None
     with torch.autocast("cuda", dtype=dtype, enabled=device.type == "cuda"):
         tokens, patch_start = model.aggregator(images.unsqueeze(0))
@@ -364,8 +360,18 @@ def _predict_camera(model, images, device):
         # Copy that small slice before releasing the image tokens.
         camera_tokens = tokens[-1][:, :, :patch_start].contiguous()
     del tokens
-    with torch.autocast(device.type, enabled=False):
-        return model.camera_head([camera_tokens], patch_token_start=patch_start).float().cpu()
+    head = model.camera_head
+    staged = compact and device.type == "cuda"
+    if staged:
+        torch.cuda.empty_cache()
+    try:
+        if staged:
+            head.to(device)
+        with torch.autocast(device.type, enabled=False):
+            return head([camera_tokens], patch_token_start=patch_start).float().cpu()
+    finally:
+        if staged:
+            head.to("cpu")
 
 
 def _save_video_frames(
@@ -491,7 +497,7 @@ def extract_vggt_camera(
         ).to(device_obj)
 
         with torch.inference_mode():
-            pose = _predict_camera(model, images, device_obj)
+            pose = _predict_camera(model, images, device_obj, compact=compact)
             if not torch.isfinite(pose).all():
                 raise _CameraPrecisionError("相机姿态包含非有限数值。")
             extrinsic, intrinsic = encoding_to_camera(
@@ -548,6 +554,7 @@ def extract_vggt_camera(
                 checkpoint_path=checkpoint_path,
                 image_resolution=image_resolution,
                 camera_profile=profile,
+                camera_quality_revision=_CAMERA_QUALITY_REVISION,
                 camera_peak_reserved_mib=peak_reserved,
                 camera_peak_allocated_mib=peak_allocated,
                 preprocess_mode=preprocess_mode,
