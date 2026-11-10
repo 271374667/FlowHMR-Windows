@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import math
+import mimetypes
 import os
 import queue
 import re
@@ -63,6 +64,25 @@ SUB = "input"  # every job stores its upload as input.<ext>, so intermediates li
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
+
+# On Windows, Python's mimetypes resolves extensions through the registry, so a
+# machine whose HKCR\.js "Content Type" is text/plain makes every .js file we
+# serve come back as text/plain. Browsers enforce a JavaScript MIME type on
+# module scripts and silently refuse to run the page, so pin the types we ship
+# instead of trusting whatever the host reports.
+for _extension, _mime_type in (
+    (".js", "text/javascript"),
+    (".mjs", "text/javascript"),
+    (".css", "text/css"),
+    (".json", "application/json"),
+    (".map", "application/json"),
+    (".wasm", "application/wasm"),
+    (".svg", "image/svg+xml"),
+    (".glb", "model/gltf-binary"),
+    (".gltf", "model/gltf+json"),
+):
+    mimetypes.add_type(_mime_type, _extension)
+
 MODEL_DOWNLOADS = ModelDownloads(app.logger)
 RUNTIME.logger = app.logger
 RUNTIME_SWITCH_LOCK = threading.Lock()
