@@ -963,7 +963,11 @@ def index():
 
 @app.route("/static/<path:path>")
 def static_files(path):
-    return send_from_directory(os.path.join(WEB_DIR, "static"), path)
+    # A 304 response carries no Content-Type, so a client that once cached these
+    # files under a wrong MIME type keeps reusing that type and never recovers,
+    # even after the server is fixed. Always answer with the full response so the
+    # MIME type we send is authoritative.
+    return send_from_directory(os.path.join(WEB_DIR, "static"), path, conditional=False)
 
 
 def local_model_request():
