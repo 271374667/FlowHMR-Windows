@@ -142,7 +142,7 @@ def get_postprocess(floor, preset, *, sole_fit_strength=0.0):
 DEFAULT_PARAMS = {
     "seed": 0, "cfg_scale": 1.0, "steps": 20, "max_frames": None, "vggt_interval": 0,
     "sam_chunk_size": None, "start_frame": 0, "end_frame": None,
-    "postprocess": False, "manual_select": True, "auto_frames": True, "static_camera": False,
+    "postprocess": False, "manual_select": True, "auto_frames": True, "static_camera": True,
     "correction_floor_m": None, "correction_preset": "normal", "sole_fit": False, "sole_fit_strength": 0.0,
     "smoothing_frames": 0.0, "hamer": False, "hamer_stride": 1,
 }
@@ -229,6 +229,7 @@ def parse_params(src, base=None):
     if preset not in ("normal", "strong"):
         raise ValueError("脚步锁定须选择标准或加强。")
 
+    vggt_interval = number("vggt_interval", int, 0, 120)
     return {
         "seed": number("seed", int, 0, 2 ** 31 - 1),
         "cfg_scale": number("cfg_scale", float, 0.0, 10.0),
@@ -239,7 +240,7 @@ def parse_params(src, base=None):
         "smoothing_frames": smoothing,
         "hamer": _to_bool(src.get("hamer"), base["hamer"]),
         "hamer_stride": hamer_stride,
-        "vggt_interval": number("vggt_interval", int, 0, 120),
+        "vggt_interval": vggt_interval,
         "sam_chunk_size": integer("sam_chunk_size", 1, optional=True),
         "postprocess": _to_bool(src.get("postprocess"), base["postprocess"]),
         "correction_floor_m": floor,
@@ -247,7 +248,7 @@ def parse_params(src, base=None):
         "sole_fit": sole_fit_strength > 0,
         "sole_fit_strength": sole_fit_strength,
         "manual_select": _to_bool(src.get("manual_select"), base.get("manual_select", True)),
-        "static_camera": _to_bool(src.get("static_camera"), base["static_camera"]),
+        "static_camera": _to_bool(src.get("static_camera"), base["static_camera"] and vggt_interval == 0),
     }
 
 
@@ -265,7 +266,8 @@ def camera_summary(directory, params):
             return {"mode": "manual" if params.get("vggt_interval") else "auto",
                     "interval": int(data["camera_sampling_interval"]),
                     "samples": int(data["camera_sample_indices"].size),
-                    "frames": len(data["K"])}
+                    "frames": len(data["K"]),
+                    "profile": str(data["camera_profile"]) if "camera_profile" in data else None}
     except (OSError, ValueError, KeyError, BadZipFile):
         return None
 
@@ -383,7 +385,9 @@ def restore_jobs():
             strength = _read_sole_fit_strength(saved_params)
         except ValueError:
             strength = 0.0
-        job["params"] = {**DEFAULT_PARAMS, **saved_params, "sole_fit": strength > 0, "sole_fit_strength": strength}
+        # Jobs saved before this default changed used moving-camera estimation.
+        job["params"] = {**DEFAULT_PARAMS, "static_camera": False, **saved_params,
+                         "sole_fit": strength > 0, "sole_fit_strength": strength}
         job.setdefault("stages", [])
         report = job.get("hamer_report")
         if report and not any(stage["name"] == "hamer" for stage in job["stages"]):
@@ -1417,6 +1421,9 @@ def api_fbx(job_id):
     mode = request.args.get("mesh", "1")
     if mode not in ("0", "1"):
         return jsonify(error="请选择仅骨架或包含蒙皮网格。"), 400
+    first_pose = request.args.get("first_pose", "none")
+    if first_pose not in ("none", "t", "a"):
+        return jsonify(error="首帧参考姿势请选择不添加、T Pose 或 A Pose。"), 400
     with_skin = mode == "1"
     suffix = "skin" if with_skin else "skeleton"
     body = request.args.get("body", "neutral") if with_skin else "neutral"
@@ -1439,17 +1446,19 @@ def api_fbx(job_id):
     with FBX_EXPORT_LOCK:
         exports = os.path.join(directory, "scene" if is_scene else "", "exports")
         prefix = f"fbx_scene_v2_{signature}" if is_scene else "fbx_mmr_v2"
-        path = os.path.join(exports, f"{prefix}_{file_stamp(source)}_{suffix}{tag}.fbx")
+        pose_tag = f"_{first_pose}_pose" if first_pose != "none" else ""
+        path = os.path.join(exports, f"{prefix}_{file_stamp(source)}_{suffix}{tag}{pose_tag}.fbx")
         if not os.path.isfile(path):
             from flowhmr.core.export.smplh2fbx import SMPLH2FBX
 
             with SMPLH2FBX() as converter:
                 if chosen is None:
-                    converter.convert_npz_to_fbx(source, path, export_mesh=with_skin, variant_path=variant)
+                    converter.convert_npz_to_fbx(source, path, export_mesh=with_skin, variant_path=variant, first_pose=first_pose)
                 else:
-                    converter.convert_scene_to_fbx(source, chosen, path, export_mesh=with_skin, variant_path=variant)
+                    converter.convert_scene_to_fbx(source, chosen, path, export_mesh=with_skin, variant_path=variant, first_pose=first_pose)
     if variant:
         suffix = f"{body}_{suffix}"
+    suffix += pose_tag
     if is_scene:
         stem = os.path.splitext(job["filename"])[0]
         group = ("scene" if len(chosen) == len(available) else f"person{chosen[0]['person']}" if len(chosen) == 1

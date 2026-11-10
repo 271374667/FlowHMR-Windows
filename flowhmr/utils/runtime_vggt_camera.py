@@ -14,6 +14,7 @@ import multiprocessing
 import shutil
 import sys
 import tempfile
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 from zipfile import BadZipFile
@@ -38,7 +39,9 @@ class VGGTCameraResult:
     image_size_hw: tuple[int, int]
 
 
-_VGGT_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+_VGGT_MODEL_CACHE: dict[tuple[str, str, bool], Any] = {}
+_MIB = 1024 ** 2
+_GIB = 1024 ** 3
 
 
 def camera_intervals(frames: int, requested: int) -> tuple[int, ...]:
@@ -74,23 +77,69 @@ def _read_camera_cache(path, frame_range, expected_len, intervals):
 
 
 _CAMERA_MEMORY_EXIT = 75
+_CAMERA_PRECISION_EXIT = 76
 
 
-def _camera_worker(video_path, output_npz, frame_range, frames, device, interval):
+class _CameraPrecisionError(RuntimeError):
+    pass
+
+
+def camera_cuda_budget(device):
+    free, total = torch.cuda.mem_get_info(device)
+    return max(0, free - max(768 * _MIB, int(total * 0.06)))
+
+
+def _camera_attempts(frames, requested, device, budget):
+    device = torch.device(device)
+    full, medium, low = (requested or max(1, math.ceil((frames - 1) / (count - 1)))
+                         for count in (64, 32, 16))
+    if device.type != "cuda":
+        yield device, medium, 320, False
+        return
+    if budget >= 8 * _GIB:
+        yield device, full, 512, False
+    if budget >= 4608 * _MIB:
+        yield device, full, 384, True
+    if budget >= 3 * _GIB:
+        yield device, medium, 320, True
+        yield device, low, 256, True
+    # A CPU retry keeps the moving camera and the requested manual interval.
+    # Bound it so a very dense manual run cannot exhaust system RAM instead.
+    if _sample_count(frames, low) <= 32:
+        yield torch.device("cpu"), low, 256, False
+
+
+def _sample_count(frames, interval):
+    return (frames - 2) // interval + 2 if frames > 1 else 1
+
+
+def _camera_worker(video_path, output_npz, frame_range, frames, device, interval, resolution, compact, budget):
+    device = torch.device(device)
     try:
-        device = torch.device(device)
         if device.type == "cuda":
-            free, total = torch.cuda.mem_get_info(device)
-            reserve = max(1024 ** 3, int(total * 0.06))
-            if free <= reserve:
+            _, total = torch.cuda.mem_get_info(device)
+            limit = min(budget, camera_cuda_budget(device))
+            if limit < 3 * _GIB:
                 raise torch.cuda.OutOfMemoryError("No CUDA memory remains for camera estimation")
-            torch.cuda.set_per_process_memory_fraction((free - reserve) / total, device)
+            torch.cuda.set_per_process_memory_fraction(limit / total, device)
+            torch.cuda.reset_peak_memory_stats(device)
+            if _vggt_dtype(device) == torch.float16:
+                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+            print(f"  [vggt] CUDA allocator budget: {limit / _MIB:.0f} MiB", flush=True)
+        else:
+            torch.set_num_threads(min(8, torch.get_num_threads()))
         extract_vggt_camera(video_path, output_npz=output_npz, frame_range=frame_range,
-                            expected_len=frames, device=device, frame_interval=interval)
-    except torch.cuda.OutOfMemoryError as error:
-        print(f"  [vggt] CUDA memory limit: {error}", file=sys.stderr, flush=True)
-        raise SystemExit(_CAMERA_MEMORY_EXIT) from None
+                            expected_len=frames, device=device, frame_interval=interval,
+                            image_resolution=resolution, compact=compact)
     except Exception as error:
+        if device.type == "cuda" and isinstance(error, _CameraPrecisionError):
+            print(f"  [vggt] CUDA precision: {error}", file=sys.stderr, flush=True)
+            raise SystemExit(_CAMERA_PRECISION_EXIT) from None
+        if device.type == "cuda" and (isinstance(error, torch.cuda.OutOfMemoryError) or any(
+                name in str(error).lower() for name in ("cuda out of memory", "cuda error: out of memory",
+                                                       "cublas_status_alloc_failed", "cudnn_status_alloc_failed"))):
+            print(f"  [vggt] CUDA memory limit: {error}", file=sys.stderr, flush=True)
+            raise SystemExit(_CAMERA_MEMORY_EXIT) from None
         # Pass a short diagnosis back to the job panel; the traceback still goes to stderr.
         try:
             with open(output_npz + ".error.txt", "w", encoding="utf-8") as report:
@@ -101,7 +150,7 @@ def _camera_worker(video_path, output_npz, frame_range, frames, device, interval
 
 
 def extract_vggt_camera_isolated(video_path, *, output_npz, frame_range, expected_len,
-                                 device, frame_interval, cancel_check, on_progress):
+                                 device, frame_interval, cancel_check, on_progress, release_cuda=nullcontext):
     """Run the expensive camera forward in a cancellable process with a VRAM budget."""
     intervals = camera_intervals(expected_len, frame_interval)
     cached = _read_camera_cache(output_npz, frame_range, expected_len, intervals)
@@ -110,15 +159,20 @@ def extract_vggt_camera_isolated(video_path, *, output_npz, frame_range, expecte
         on_progress("已复用相机估计")
         return cached
 
-    with tempfile.TemporaryDirectory(prefix=".camera-", dir=osp.dirname(osp.abspath(output_npz))) as scratch:
+    device = torch.device(device)
+    cancel_check()
+    invalid_pose = False
+    with release_cuda(), tempfile.TemporaryDirectory(prefix=".camera-", dir=osp.dirname(osp.abspath(output_npz))) as scratch:
+        budget = camera_cuda_budget(device) if device.type == "cuda" else None
         temporary = osp.join(scratch, "camera.npz")
-        for interval in intervals:
+        for target, interval, resolution, compact in _camera_attempts(expected_len, frame_interval, device, budget):
             cancel_check()
-            samples = (expected_len - 2) // interval + 2 if expected_len > 1 else 1
-            on_progress(f"相机采样 {samples}/{expected_len} 帧 · 间隔 {interval}")
+            samples = _sample_count(expected_len, interval)
+            mode = "CPU 相机估计" if target.type == "cpu" else "省显存相机估计" if compact else "相机估计"
+            on_progress(f"{mode} · 采样 {samples}/{expected_len} 帧 · 间隔 {interval}")
             process = multiprocessing.get_context("spawn").Process(
                 target=_camera_worker,
-                args=(video_path, temporary, frame_range, expected_len, str(device), interval),
+                args=(video_path, temporary, frame_range, expected_len, str(target), interval, resolution, compact, budget),
                 daemon=True,
             )
             process.start()
@@ -135,6 +189,9 @@ def extract_vggt_camera_isolated(video_path, *, output_npz, frame_range, expecte
                 process.close()
             if code == _CAMERA_MEMORY_EXIT:
                 continue
+            if code == _CAMERA_PRECISION_EXIT:
+                invalid_pose = True
+                continue
             if code != 0:
                 try:
                     with open(temporary + ".error.txt", encoding="utf-8") as report:
@@ -149,7 +206,9 @@ def extract_vggt_camera_isolated(video_path, *, output_npz, frame_range, expecte
                 raise RuntimeError("相机计算没有产出有效结果。")
             os.replace(temporary, output_npz)
             return result
-    raise RuntimeError("相机估计显存不足。可增大采样间隔，固定机位素材可选择「固定机位」。")
+    if invalid_pose:
+        raise RuntimeError("当前 GPU 的相机估计未得到有效结果。请改用自动采样或增大手动间隔，以便使用 CPU 重试。")
+    raise RuntimeError("移动相机估计可用显存不足。请释放其他程序占用的显存，或使用自动采样、增大手动采样间隔。")
 
 
 def make_static_camera(image_size_hw, *, frame_range, output_npz=None) -> VGGTCameraResult:
@@ -248,8 +307,12 @@ def _vggt_opencv_to_yup_rt(camera_rt: torch.Tensor) -> torch.Tensor:
     return camera_rt @ vggt_from_yup
 
 
-def _load_vggt_model(checkpoint_path: str, device: Any) -> Any:
-    key = (osp.abspath(checkpoint_path), str(device))
+def _vggt_dtype(device):
+    return torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+
+
+def _load_vggt_model(checkpoint_path: str, device: torch.device, compact: bool) -> Any:
+    key = (osp.abspath(checkpoint_path), str(device), compact)
     if key in _VGGT_MODEL_CACHE:
         return _VGGT_MODEL_CACHE[key]
     if not osp.isfile(checkpoint_path):
@@ -257,12 +320,52 @@ def _load_vggt_model(checkpoint_path: str, device: Any) -> Any:
 
     from vggt_omega.models import VGGTOmega
 
-    model = VGGTOmega().eval()
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(state_dict)
-    model = model.to(device)
+    # FlowHMR consumes only camera poses. Map the original checkpoint and
+    # initialize only the modules used here, without loading a second RAM copy.
+    with torch.device("meta"):
+        model = VGGTOmega(enable_depth=False, autocast=False).eval()
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
+    model.load_state_dict({k: v for k, v in state_dict.items() if not k.startswith("dense_head.")}, assign=True)
+    encoder = model.aggregator
+    encoder.cached_layer_indices = {encoder.depth - 1}
+    if compact and device.type == "cuda":
+        dtype = _vggt_dtype(device)
+        # Keep camera regression and positional constants in FP32. Moving the
+        # encoder in its inference dtype avoids holding two copies on the GPU.
+        float_buffers = [(module, name, getattr(module, name)) for module, name in (
+            (encoder, "_resnet_mean"), (encoder, "_resnet_std"),
+            (encoder.rope_embed, "periods"), (encoder.patch_embed.rope_embed, "periods"),
+        )]
+        float_scales = []
+        if dtype == torch.float16:
+            # DINOv3's residual scale multiplication can exceed FP16 range
+            # even when its inputs are finite. Leave these small vectors in FP32.
+            from vggt_omega.models.layers import LayerScale
+
+            float_scales = [(module, module.gamma.detach()) for module in encoder.modules()
+                            if isinstance(module, LayerScale)]
+        encoder.to(device=device, dtype=dtype)
+        for module, name, buffer in float_buffers:
+            setattr(module, name, buffer.to(device))
+        for module, scale in float_scales:
+            module.gamma = torch.nn.Parameter(scale.to(device), requires_grad=False)
+        model.camera_head.to(device)
+    else:
+        model.to(device)
     _VGGT_MODEL_CACHE[key] = model
     return model
+
+
+def _predict_camera(model, images, device):
+    dtype = _vggt_dtype(device) if device.type == "cuda" else None
+    with torch.autocast("cuda", dtype=dtype, enabled=device.type == "cuda"):
+        tokens, patch_start = model.aggregator(images.unsqueeze(0))
+        # CameraHead consumes only camera/register tokens from the last layer.
+        # Copy that small slice before releasing the image tokens.
+        camera_tokens = tokens[-1][:, :, :patch_start].contiguous()
+    del tokens
+    with torch.autocast(device.type, enabled=False):
+        return model.camera_head([camera_tokens], patch_token_start=patch_start).float().cpu()
 
 
 def _save_video_frames(
@@ -330,6 +433,7 @@ def extract_vggt_camera(
     preprocess_mode: str = "max_size",
     keep_frames: bool = False,
     frame_interval: int = 1,
+    compact: bool = False,
 ) -> VGGTCameraResult:
     frame_interval = max(1, int(frame_interval))
     cached = _read_camera_cache(output_npz, frame_range, expected_len, (frame_interval,))
@@ -375,9 +479,11 @@ def extract_vggt_camera(
                 )
         else:
             target_len = sample_indices[-1] + 1
-        print(f"  [vggt] sampled {len(frame_paths)}/{target_len} frames (interval={frame_interval})")
+        profile = "cpu" if device_obj.type == "cpu" else "low_vram" if compact else "full"
+        print(f"  [vggt] sampled {len(frame_paths)}/{target_len} frames "
+              f"(interval={frame_interval}, resolution={image_resolution}, profile={profile})", flush=True)
 
-        model = _load_vggt_model(checkpoint_path, device_obj)
+        model = _load_vggt_model(checkpoint_path, device_obj, compact)
         images = load_and_preprocess_images(
             frame_paths,
             mode=preprocess_mode,
@@ -385,11 +491,15 @@ def extract_vggt_camera(
         ).to(device_obj)
 
         with torch.inference_mode():
-            predictions = model(images)
+            pose = _predict_camera(model, images, device_obj)
+            if not torch.isfinite(pose).all():
+                raise _CameraPrecisionError("相机姿态包含非有限数值。")
             extrinsic, intrinsic = encoding_to_camera(
-                predictions["pose_enc"],
+                pose,
                 original_image_size_hw,
             )
+            if not torch.isfinite(extrinsic).all() or not torch.isfinite(intrinsic).all():
+                raise _CameraPrecisionError("相机参数包含非有限数值。")
 
         # Remove batch dimension from README-style outputs.
         extrinsic = extrinsic[0] if extrinsic.ndim == 4 else extrinsic
@@ -411,7 +521,7 @@ def extract_vggt_camera(
 
         camera_RT_yup = _vggt_opencv_to_yup_rt(RT_vggt)
 
-        vggt_hw = predictions["images"].shape[-2:]
+        vggt_hw = images.shape[-2:]
         vggt_image_size_hw = (int(vggt_hw[0]), int(vggt_hw[1]))
         raw_rt_np = RT_vggt.detach().float().cpu().numpy().astype(np.float32)
         result = VGGTCameraResult(
@@ -423,6 +533,8 @@ def extract_vggt_camera(
 
         if output_npz:
             os.makedirs(osp.dirname(output_npz), exist_ok=True)
+            peak_reserved = torch.cuda.max_memory_reserved(device_obj) // _MIB if device_obj.type == "cuda" else 0
+            peak_allocated = torch.cuda.max_memory_allocated(device_obj) // _MIB if device_obj.type == "cuda" else 0
             np.savez(
                 output_npz,
                 camera_RT=result.camera_RT,
@@ -435,6 +547,9 @@ def extract_vggt_camera(
                 frame_range=np.array(frame_range if frame_range is not None else (0, T - 1), dtype=np.int64),
                 checkpoint_path=checkpoint_path,
                 image_resolution=image_resolution,
+                camera_profile=profile,
+                camera_peak_reserved_mib=peak_reserved,
+                camera_peak_allocated_mib=peak_allocated,
                 preprocess_mode=preprocess_mode,
                 camera_world="vggt_opencv_raw",
                 k_space="original_frame",
@@ -443,7 +558,8 @@ def extract_vggt_camera(
             )
             print(
                 f"  [vggt] camera saved -> {output_npz}  "
-                f"(T={T}, sampled={len(sample_indices)}, interval={frame_interval}, image_size={result.image_size_hw})"
+                f"(T={T}, sampled={len(sample_indices)}, interval={frame_interval}, image_size={result.image_size_hw}, "
+                f"CUDA peak reserved={peak_reserved} MiB)", flush=True,
             )
 
         return result

@@ -56,10 +56,14 @@ const ACTIVE = new Set(["queued", "running", "waiting_user", "cancel_requested"]
 const upload = initUpload(bus);
 const fbxDialog = $("fbxExportDialog");
 const fbxWithSkin = $("fbxWithSkin");
+const fbxFirstPose = $("fbxFirstPose");
 const fbxPeople = $("fbxPeople"), fbxConfirm = $("fbxConfirm");
 let exportPeople = [];
 const FBX_SKIN_STORAGE = "flowhmr-fbx-with-skin";
+const FBX_POSE_STORAGE = "flowhmr-fbx-first-pose";
 fbxWithSkin.checked = localStorage.getItem(FBX_SKIN_STORAGE) === "on";
+const savedFbxPose = localStorage.getItem(FBX_POSE_STORAGE);
+fbxFirstPose.value = ["t", "a"].includes(savedFbxPose) ? savedFbxPose : "none";
 function setExportPeople(scene) {
   exportPeople = (scene?.people ?? []).map(({ person }) => {
     const label = el("label", "fbx-export-person");
@@ -82,14 +86,18 @@ $("dlFbx").onclick = () => {
   fbxDialog.returnValue = "";
   fbxDialog.showModal();
 };
-fbxDialog.addEventListener("close", () => {
-  if (fbxDialog.returnValue !== "export" || !currentJob || loadedResult !== currentJob) return;
+fbxDialog.querySelector("form").addEventListener("submit", (event) => {
+  if (event.submitter !== fbxConfirm) return;
+  event.preventDefault();
+  if (!currentJob || loadedResult !== currentJob) return;
   const people = exportPeople.filter(({ input }) => input.checked).map(({ input }) => input.value);
   if (exportPeople.length && !people.length) return;
   localStorage.setItem(FBX_SKIN_STORAGE, fbxWithSkin.checked ? "on" : "off");
+  localStorage.setItem(FBX_POSE_STORAGE, fbxFirstPose.value);
   const link = document.createElement("a");
-  link.href = api.fbxUrl(currentJob, fbxWithSkin.checked, viewer.bodyVariant, people);
+  link.href = api.fbxUrl(currentJob, fbxWithSkin.checked, viewer.bodyVariant, people, fbxFirstPose.value);
   link.download = "";
+  fbxDialog.close("export");
   link.click();
 });
 for (const [menu, target] of [["menuImport", "fileInput"], ["menuFbx", "dlFbx"], ["menuNpz", "dlNpz"]]) {

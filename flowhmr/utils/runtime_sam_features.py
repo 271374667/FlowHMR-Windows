@@ -491,7 +491,7 @@ def _maybe_convert_backbone_to_fp16(sam_model, device: torch.device) -> None:
 
 
 def build_sam3d_extractor(device: torch.device, *, frame_batch_size=16,
-                          use_gpu_preprocess=True, use_compile=None) -> Sam3DTokenExtractor:
+                          use_gpu_preprocess=True, use_compile=None, load_device=None) -> Sam3DTokenExtractor:
     from .sam_compile import enable_sam_compile, resolve_sam_compile
 
     compile_backbone = resolve_sam_compile(device, use_compile)
@@ -504,7 +504,7 @@ def build_sam3d_extractor(device: torch.device, *, frame_batch_size=16,
     sam_model, sam_cfg = load_sam_3d_body(
         checkpoint_path=str(checkpoint),
         mhr_path=str(mhr),
-        device=device,
+        device=load_device if load_device is not None else device,
     )
     _maybe_convert_backbone_to_fp16(sam_model, device)
     if compile_backbone:

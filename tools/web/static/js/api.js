@@ -48,8 +48,8 @@ export const prepareScene = (id) => postJson(`/api/jobs/${id}/scene`);
 
 export const videoUrl = (id) => `/api/jobs/${id}/video`;
 export const npzUrl = (id) => `/api/jobs/${id}/npz`;
-export const fbxUrl = (id, withSkin, body = "neutral", people = []) => {
-  const query = new URLSearchParams({ mesh: withSkin ? "1" : "0", body });
+export const fbxUrl = (id, withSkin, body = "neutral", people = [], firstPose = "none") => {
+  const query = new URLSearchParams({ mesh: withSkin ? "1" : "0", body, first_pose: firstPose });
   for (const person of people) query.append("person", String(person));
   return `/api/jobs/${id}/fbx?${query}`;
 };

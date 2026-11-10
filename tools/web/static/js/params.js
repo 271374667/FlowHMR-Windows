@@ -4,6 +4,8 @@ import { $, show } from "./utils.js";
 const MAX_SMOOTHING_FRAMES = 3;
 const validStrength = (value) => Number.isFinite(value) && value >= 0 && value <= 1;
 const STORAGE = "flowhmr-generation-preferences";
+const CAMERA_MODES = ["static", "auto", "manual"];
+const cameraModeFor = (p) => (p.static_camera ?? !(p.vggt_interval > 0)) ? "static" : p.vggt_interval > 0 ? "manual" : "auto";
 
 function bindToggle(id) {
   const btn = $(id);
@@ -35,6 +37,8 @@ export function initParams(defaults, manualBatchDefault) {
   const soleFitSlider = $("optSoleFitStrength"), soleFit = $("optSoleFitValue");
   const autoBatch = bindToggle("optSamAuto");
   const cameraMode = $("optCameraMode");
+  const defaultCamera = cameraModeFor(defaults || {});
+  let preferredCamera = null;
   const footLockPreset = $("optFootLockPreset");
   const correctionGround = $("optCorrectionGround"), correctionHeight = $("optCorrectionHeight");
   const seed = $("optSeed"), cfg = $("optCfg"), stride = $("optVggt");
@@ -82,9 +86,9 @@ export function initParams(defaults, manualBatchDefault) {
     stride.disabled = cameraMode.value !== "manual";
     show("manualCameraRow", !stride.disabled);
     $("cameraHint").textContent = {
-      auto: "按人物轨迹长度选择采样间隔。",
-      static: "适用于无移动、无变焦的固定机位。",
-      manual: "间隔越小，采样越密，显存开销越高。",
+      auto: "用于镜头明显旋转的素材。自动选择采样间隔；显存紧张时会节省显存。",
+      static: "仅平移、推拉或缩放通常选固定机位。镜头明显转向、俯仰或滚转时，选运动相机。",
+      manual: "用于镜头明显旋转的素材。间隔越小，采样越密，显存开销越高。",
     }[cameraMode.value];
   };
   cameraMode.addEventListener("change", syncCamera);
@@ -115,7 +119,7 @@ export function initParams(defaults, manualBatchDefault) {
     correctionGround.value = p.correction_floor_m == null ? "auto" : "manual";
     correctionHeight.value = p.correction_floor_m ?? correction?.floor_m?.toFixed(3) ?? 0;
     autoBatch.set(p.sam_chunk_size == null);
-    cameraMode.value = p.static_camera ? "static" : p.vggt_interval > 0 ? "manual" : "auto";
+    cameraMode.value = cameraModeFor(p);
     seed.value = p.seed ?? 0;
     cfg.value = p.cfg_scale ?? 1.0;
     stride.value = p.vggt_interval > 0 ? p.vggt_interval : prefs?.manualInterval ?? 10;
@@ -161,14 +165,22 @@ export function initParams(defaults, manualBatchDefault) {
   };
 
   let remembered = null, jobId = null;
+  function preferencesForNewSource(prefs) {
+    const mode = preferredCamera ?? defaultCamera;
+    return { ...defaults, ...prefs.params, correction_floor_m: null, static_camera: mode === "static",
+      vggt_interval: mode === "manual" ? (prefs.manualInterval ?? prefs.params.vggt_interval ?? 10) : 0 };
+  }
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE) || "null");
     if (saved?.params && typeof saved.params === "object") {
-      apply({ ...defaults, ...saved.params, correction_floor_m: null }, null, saved);
+      // Older versions saved "auto" with every edit, even if nobody selected it.
+      const mode = Object.hasOwn(saved, "cameraMode") ? saved.cameraMode : cameraModeFor(saved.params);
+      preferredCamera = CAMERA_MODES.includes(mode) && (Object.hasOwn(saved, "cameraMode") || mode !== "auto") ? mode : null;
+      apply(preferencesForNewSource(saved), null, saved);
       read({}, true);
       remembered = saved;
     }
-  } catch { /* Invalid or unavailable local preferences: use the defaults. */ }
+  } catch { preferredCamera = null; }
   if (!remembered) apply(defaults || {});
 
   function rememberSettings() {
@@ -176,7 +188,7 @@ export function initParams(defaults, manualBatchDefault) {
       const { correction_floor_m, ...params } = read({}, true);
       const manualBatch = samChunk.valueAsNumber;
       const manualInterval = stride.valueAsNumber;
-      remembered = { jobId, params,
+      remembered = { jobId, params, cameraMode: preferredCamera,
         manualBatch: Number.isSafeInteger(manualBatch) && manualBatch > 0 ? manualBatch : manualBatchDefault,
         manualInterval: Number.isInteger(manualInterval) && manualInterval >= 1 && manualInterval <= 120 ? manualInterval : 10,
       };
@@ -186,7 +198,11 @@ export function initParams(defaults, manualBatchDefault) {
   for (const input of [seed, cfg, stride, steps, samChunk, smoothingSlider, smoothing, soleFitSlider, soleFit]) {
     input.addEventListener("input", rememberSettings);
   }
-  for (const input of [cameraMode, footLockPreset, hamerStride]) input.addEventListener("change", rememberSettings);
+  cameraMode.addEventListener("change", () => {
+    preferredCamera = cameraMode.value;
+    rememberSettings();
+  });
+  for (const input of [footLockPreset, hamerStride]) input.addEventListener("change", rememberSettings);
   for (const id of ["optManual", "optPostprocess", "optHamer", "optSamAuto"]) $(id).addEventListener("click", rememberSettings);
 
   const suggestCorrectionHeight = (report) => {
@@ -203,16 +219,18 @@ export function initParams(defaults, manualBatchDefault) {
       const draft = restoreDraft && remembered?.jobId === id ? remembered : null;
       apply({ ...params, ...draft?.params }, correction, draft);
     },
-    reset() { apply(defaults || {}); rememberSettings(); },
+    reset() { preferredCamera = null; apply(defaults || {}); rememberSettings(); },
     newSource() {
       jobId = null;
       if (remembered) {
-        apply({ ...defaults, ...remembered.params, correction_floor_m: null }, null, remembered);
+        apply(preferencesForNewSource(remembered), null, remembered);
         return;
       }
       // A manual floor belongs to the previous video.
       correctionGround.value = "auto";
       correctionHeight.value = 0;
+      cameraMode.value = defaultCamera;
+      syncCamera();
       syncCorrection();
     },
   };

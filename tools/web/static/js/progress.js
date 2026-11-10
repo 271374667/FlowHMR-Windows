@@ -82,7 +82,7 @@ export function initProgress() {
       $("jobMsg").textContent = msg;
       const camera = job.camera;
       const cameraInfo = !camera ? "" : camera.mode === "static" ? "相机 · 固定机位"
-        : `相机 · ${camera.mode === "auto" ? "自动" : "手动"} · 采样 ${camera.samples}/${camera.frames} 帧 · 间隔 ${camera.interval}`;
+        : `相机 · ${camera.mode === "auto" ? "自动" : "手动"}${camera.profile === "low_vram" ? " · 省显存" : camera.profile === "cpu" ? " · CPU" : ""} · 采样 ${camera.samples}/${camera.frames} 帧 · 间隔 ${camera.interval}`;
       $("jobCamera").textContent = cameraInfo;
       show("jobCamera", !!cameraInfo);
       const batch = job.sam_batch;

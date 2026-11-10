@@ -140,17 +140,17 @@
       <hr class="property-divider">
       <label class="field camera-mode">
         <span>相机模式</span>
-        <select class="input" id="optCameraMode">
-          <option value="auto" selected>自动估计</option>
-          <option value="static">固定机位</option>
-          <option value="manual">手动采样</option>
+        <select class="input" id="optCameraMode" aria-describedby="cameraHint">
+          <option value="static" selected>固定机位</option>
+          <option value="auto">运动相机 · 自动</option>
+          <option value="manual">运动相机 · 手动采样</option>
         </select>
       </label>
       <label class="field camera-mode hidden" id="manualCameraRow">
         <span>每 N 帧估计一次相机</span>
         <input class="input" id="optVggt" type="number" min="1" max="120" step="1" value="10">
       </label>
-      <p class="setting-help" id="cameraHint"></p>
+      <p class="setting-help" id="cameraHint">仅平移、推拉或缩放通常选固定机位。镜头明显转向、俯仰或滚转时，选运动相机。</p>
       <div class="setting-row person-setting">
         <div>
           <div class="setting-label">手动选人</div>
@@ -469,6 +469,15 @@
     </fieldset>
     <label class="fbx-export-skin"><input type="checkbox" id="fbxWithSkin"> 包含蒙皮网格</label>
     <p class="setting-help">带蒙皮时使用当前预览体型。仅用于重定向时，导出动画骨架即可。</p>
+    <label class="fbx-export-pose" for="fbxFirstPose">
+      <span>首帧参考姿势</span>
+      <select id="fbxFirstPose" class="input">
+        <option value="none">不添加</option>
+        <option value="t">T Pose</option>
+        <option value="a">A Pose</option>
+      </select>
+    </label>
+    <p class="setting-help">参考姿势写入第 −1 帧，原动作帧号不变。</p>
     <div class="fbx-export-actions">
       <button class="btn-secondary small" value="cancel">取消</button>
       <button class="btn-primary small" id="fbxConfirm" value="export">导出</button>

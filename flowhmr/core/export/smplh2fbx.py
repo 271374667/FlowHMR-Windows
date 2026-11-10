@@ -43,6 +43,31 @@ FBX_JOINT_NAMES = (
 HEAD_JOINT = FBX_JOINT_NAMES.index("Head")
 
 
+def _align_direction(source, target):
+    source = source / np.linalg.norm(source)
+    x, y, z = np.cross(source, target)
+    cross = np.array([[0., -z, y], [z, 0., -x], [-y, x, 0.]])
+    # Each target points out along the same side as its rest arm.
+    return np.eye(3) + cross + cross @ cross / (1. + source @ target)
+
+
+def _reference_rotations(joints, initial_root, pose):
+    """Level the body and set both arm segments to the requested angle from horizontal."""
+    rotations = np.repeat(np.eye(3)[None], len(joints), axis=0)
+    forward = initial_root[[0, 2], 2]
+    yaw = (np.arctan2(*forward) if np.linalg.norm(forward) > 1e-6
+           else np.arctan2(-initial_root[2, 0], initial_root[0, 0]))
+    c, s = np.cos(yaw), np.sin(yaw)
+    rotations[0] = [[c, 0., s], [0., 1., 0.], [-s, 0., c]]
+    angle = 0. if pose == "t" else np.pi / 4
+    for upper, lower, hand in ((16, 18, 20), (17, 19, 21)):
+        arm = joints[lower] - joints[upper]
+        target = np.array([np.copysign(np.cos(angle), arm[0]), -np.sin(angle), 0.])
+        rotations[upper] = _align_direction(arm, target)
+        rotations[lower] = _align_direction(joints[hand] - joints[lower], rotations[upper].T @ target)
+    return rotations
+
+
 def _display_frames(joints, parents, *, head_top_y):
     """A right-handed frame with +Y along each bone's reference direction."""
     main_child = {0: 3, 9: 12, 20: 25, 21: 40}
@@ -190,17 +215,18 @@ class SMPLH2FBX:
         self.mgr.Destroy()
 
     def convert_npz_to_fbx(self, npz_data, outname: str, fps: int = 30, export_mesh: bool = True,
-                           variant_path=None) -> bool:
+                           variant_path=None, *, first_pose="none") -> bool:
         if isinstance(npz_data, (str, os.PathLike)):
             with np.load(npz_data, allow_pickle=False) as data:
                 npz_data = {k: data[k] for k in ("poses", "trans", "betas", "mocap_framerate") if k in data}
 
         fps = int(npz_data.get("mocap_framerate", fps))
         end = np.asarray(npz_data["poses"]).size // (52 * 3) - 1
-        return self._write_motions([(None, 0, npz_data)], outname, fps, end, export_mesh, variant_path)
+        return self._write_motions([(None, 0, npz_data)], outname, fps, end, export_mesh, variant_path, first_pose)
 
-    def convert_scene_to_fbx(self, npz_path, people, outname, *, export_mesh=True, variant_path=None) -> bool:
-        """Build one FBX scene, leaving each rig's keys on its source video frames."""
+    def convert_scene_to_fbx(self, npz_path, people, outname, *, export_mesh=True, variant_path=None,
+                             first_pose="none") -> bool:
+        """Build one FBX scene with a shared timeline for all people."""
         with np.load(npz_path, allow_pickle=False) as data:
             motions = []
             for person in people:
@@ -210,9 +236,9 @@ class SMPLH2FBX:
                     raise ValueError("FBX source range does not match the scene motion")
                 motions.append((number, first, motion))
             return self._write_motions(motions, outname, int(data["mocap_framerate"]),
-                                       max(p["end"] for p in people), export_mesh, variant_path)
+                                       max(p["end"] for p in people), export_mesh, variant_path, first_pose)
 
-    def _add_motion(self, scene, layer, npz_data, number, start, frame_dur, end, export_mesh, variant_path):
+    def _add_motion(self, scene, layer, npz_data, number, start, frame_dur, end, export_mesh, variant_path, first_pose):
         poses = np.asarray(npz_data["poses"], dtype=np.float32).reshape(-1, 52, 3)
         trans = np.asarray(npz_data["trans"], dtype=np.float64)
         betas = np.asarray(npz_data["betas"], dtype=np.float32)
@@ -238,6 +264,11 @@ class SMPLH2FBX:
         # the original world frame preserves the motion and skinned positions.
         rot_mats = angle_axis_to_rotation_matrix(torch.from_numpy(poses)).numpy()
         rotations = basis.transpose(0, 2, 1) @ rot_mats @ basis
+        reference = first_pose != "none"
+        reference_rotations = reference_translation = None
+        if reference:
+            reference_rotations = basis.transpose(0, 2, 1) @ _reference_rotations(joints, rot_mats[0, 0], first_pose) @ basis
+            reference_translation = offsets[0] + np.array([trans[0, 0], floor_offset[1], trans[0, 2]])
         parent_node = None
         if number is not None:
             parent_node = fbx.FbxNode.Create(scene, f"Person {number}")
@@ -258,16 +289,23 @@ class SMPLH2FBX:
         else:
             store_bind_pose(scene, skel_nodes)
 
-        animate_translation(layer, skel_nodes[0], trans + offsets[0], frame_dur, start_frame=start)
+        animate_translation(layer, skel_nodes[0], trans + offsets[0], frame_dur, start_frame=start,
+                            preroll=reference_translation)
         for i, node in enumerate(skel_nodes):
-            animate_rotation_from_rotmats(layer, node, rotations[:, i], frame_dur, start_frame=start)
+            animate_rotation_from_rotmats(layer, node, rotations[:, i], frame_dur, start_frame=start,
+                                          preroll=reference_rotations[i] if reference else None)
         stop = start + len(poses) - 1
-        if parent_node is not None and (start or stop < end):
+        delayed = start > 0
+        if parent_node is not None and (delayed or stop < end):
             # A visibility curve preserves the track interval in FBX-capable scene viewers.
             curve = parent_node.Visibility.GetCurve(layer, True)
-            keys = [(0, 0.), (start, 1.)] if start else [(0, 1.)]
+            keys = {0: 1., start: 1.}
+            if delayed:
+                keys[0] = 0.
+            if reference:
+                keys[-1] = 1.
             if stop < end:
-                keys.append((stop + 1, 0.))
+                keys[stop + 1] = 0.
 
             def step_keys(channel, values):
                 channel.KeyModifyBegin()
@@ -279,21 +317,26 @@ class SMPLH2FBX:
                     channel.KeySetInterpolation(key, fbx.FbxAnimCurveDef.EInterpolationType.eInterpolationConstant)
                 channel.KeyModifyEnd()
 
-            step_keys(curve, keys)
+            step_keys(curve, sorted(keys.items()))
             # Blender imports transforms but ignores animated FBX visibility. Scale only
             # the enclosing empty outside the track; keep every active frame at unit scale.
             hidden = 1e-5
-            scale = {0: hidden if start else 1., start: 1., stop: 1.}
-            if start:
+            scale = {0: 1., start: 1., stop: 1.}
+            if delayed:
+                scale[0] = hidden
                 scale[start - 1] = hidden
+            if reference:
+                scale[-1] = 1.
             if stop < end:
                 scale[stop + 1] = hidden
             for axis in "XYZ":
                 step_keys(parent_node.LclScaling.GetCurve(layer, axis, True), sorted(scale.items()))
 
-    def _write_motions(self, motions, outname, fps, end, export_mesh, variant_path):
+    def _write_motions(self, motions, outname, fps, end, export_mesh, variant_path, first_pose):
         if not motions or fps <= 0 or end < 0:
             raise ValueError("Invalid FBX timeline")
+        if first_pose not in ("none", "t", "a"):
+            raise ValueError("Invalid FBX reference pose")
         scene = fbx.FbxScene.Create(self.mgr, "")
         try:
             settings = scene.GetGlobalSettings()
@@ -302,7 +345,7 @@ class SMPLH2FBX:
             settings.SetOriginalSystemUnit(fbx.FbxSystemUnit.m)
             settings.SetTimeMode(fbx.FbxTime.ConvertFrameRateToTimeMode(fps))
             first, last = fbx.FbxTime(), fbx.FbxTime()
-            first.SetSecondDouble(0.)
+            first.SetSecondDouble(-1 / fps if first_pose != "none" else 0.)
             last.SetSecondDouble(end / fps)
             span = fbx.FbxTimeSpan(first, last)
             settings.SetTimelineDefaultTimeSpan(span)
@@ -313,7 +356,7 @@ class SMPLH2FBX:
             layer = fbx.FbxAnimLayer.Create(scene, "BaseLayer")
             stack.AddMember(layer)
             for number, start, motion in motions:
-                self._add_motion(scene, layer, motion, number, start, 1.0 / fps, end, export_mesh, variant_path)
+                self._add_motion(scene, layer, motion, number, start, 1.0 / fps, end, export_mesh, variant_path, first_pose)
             export_scene_atomic(self.mgr, scene, os.fspath(outname), embed_textures=export_mesh)
         finally:
             scene.Destroy()

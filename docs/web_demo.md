@@ -13,7 +13,7 @@ and saved result path, or explain any remaining blockers.
 
 ## What the demo does
 
-Upload a video to run person detection and tracking → VGGT-Omega camera
+Upload a video to run person detection and tracking → optional VGGT-Omega camera
 estimation → SAM-3D-Body features → FlowHMR motion generation. The page shows
 the reconstructed SMPL-H motion in a 3D viewer beside the input video.
 
@@ -73,13 +73,15 @@ Changing the chunk size on re-run recomputes SAM
 features while retaining matching detection and camera caches.
 If SAM runs out of GPU memory, lower **SAM chunk**, e.g. `16` → `8` → `4`.
 
-For a fixed camera without camera motion or zoom, enable **Static camera**
-(off by default). It skips VGGT and uses a constant pose with SAM's default
-approximate intrinsics.
+**Static camera** is the default. It skips VGGT and uses a constant pose with
+SAM's approximate intrinsics. Try it first for clips with translation or zoom
+alone. If the camera noticeably turns, tilts or rolls, choose moving-camera
+estimation.
 
 For long videos or limited GPU memory, increase **VGGT stride** (e.g. `10` or `30`)
-so camera estimation processes fewer frames and interpolates in between. This
-setting applies only when **Static camera** is off.
+so camera estimation processes fewer frames and interpolates in between. In
+automatic moving-camera mode, FlowHMR adapts the resolution and sampling to
+available GPU memory. Manual mode keeps the requested sampling interval.
 
 Optional acceleration is configured before starting the service:
 

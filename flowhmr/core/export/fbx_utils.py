@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+from itertools import chain
 from typing import Dict, List, Optional, Tuple
 
 import fbx
@@ -160,37 +161,48 @@ def mat2euler_deg(R: np.ndarray, axes: str = DEFAULT_EULER_AXES) -> np.ndarray:
 
 
 def animate_single_channel(anim_layer, component, axis: str, values: np.ndarray, frame_duration: float,
-                           start_frame: int = 0) -> None:
+                           start_frame: int = 0, *, preroll=None) -> None:
     ncomp = {"X": 0, "Y": 1, "Z": 2}.get(axis, 0)
     curve = component.GetCurve(anim_layer, axis, True)
     curve.KeyModifyBegin()
     time = fbx.FbxTime()
-    for i, val in enumerate(values):
-        time.SetSecondDouble((start_frame + i) * frame_duration)
+    keys = enumerate(values, start_frame)
+    if preroll is not None:
+        keys = chain(((-1, preroll),), keys)
+    for frame, val in keys:
+        time.SetSecondDouble(frame * frame_duration)
         idx = curve.KeyAdd(time)[0]
         curve.KeySetValue(idx, float(val[ncomp] if isinstance(val, (list, np.ndarray)) else val))
         curve.KeySetInterpolation(idx, DEFAULT_INTERP)
     curve.KeyModifyEnd()
 
 
+def _nearest_xyz(angles, previous):
+    x, y, z = angles
+    choices = np.array([(x, y, z), (x + 180., 180. - y, z + 180.)])
+    delta = (choices - previous + 180.) % 360. - 180.
+    return previous + delta[np.argmin((delta * delta).sum(axis=1))]
+
+
 def animate_rotation_from_rotmats(
     anim_layer, node, rot_mats: np.ndarray, frame_duration: float, axes: str = DEFAULT_EULER_AXES,
-    *, start_frame: int = 0,
+    *, start_frame: int = 0, preroll=None,
 ) -> None:
     eulers = np.array([mat2euler_deg(m, axes) for m in rot_mats])
+    reference = mat2euler_deg(preroll, axes) if preroll is not None else None
     if axes == DEFAULT_EULER_AXES:
         # Choose the closer equivalent XYZ branch and unwrap it between keys.
         for i in range(1, len(eulers)):
-            x, y, z = eulers[i]
-            choices = np.array([(x, y, z), (x + 180., 180. - y, z + 180.)])
-            delta = (choices - eulers[i - 1] + 180.) % 360. - 180.
-            eulers[i] = eulers[i - 1] + delta[np.argmin((delta * delta).sum(axis=1))]
+            eulers[i] = _nearest_xyz(eulers[i], eulers[i - 1])
+        if reference is not None:
+            reference = _nearest_xyz(reference, eulers[0])
     for axis in ["X", "Y", "Z"]:
-        animate_single_channel(anim_layer, node.LclRotation, axis, eulers, frame_duration, start_frame)
+        animate_single_channel(anim_layer, node.LclRotation, axis, eulers, frame_duration, start_frame,
+                               preroll=reference)
 
 
 def animate_translation(anim_layer, node, translations: np.ndarray, frame_duration: float,
-                        *, start_frame: int = 0) -> None:
+                        *, start_frame: int = 0, preroll=None) -> None:
     translations = np.asarray(translations, dtype=np.float64)
     if translations.ndim == 1:
         if translations.shape[0] != 3:
@@ -202,7 +214,8 @@ def animate_translation(anim_layer, node, translations: np.ndarray, frame_durati
     else:
         raise ValueError(f"Translation must be 1D or 2D, got {translations.ndim}D")
     for axis in ["X", "Y", "Z"]:
-        animate_single_channel(anim_layer, node.LclTranslation, axis, translations, frame_duration, start_frame)
+        animate_single_channel(anim_layer, node.LclTranslation, axis, translations, frame_duration, start_frame,
+                               preroll=preroll)
 
 
 # Construction Helpers
