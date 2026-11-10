@@ -1,7 +1,7 @@
 import { $, el, formatBytes, show } from "./utils.js";
 import { getModelDownload, startModelDownload, stopModelDownload } from "./api.js";
 
-const LABELS = { ready: "已就绪", missing: "缺文件", unavailable: "未就绪" };
+const LABELS = { ready: "已就绪", missing: "缺文件", damaged: "文件损坏", unavailable: "未就绪" };
 const PHASES = { download: "下载", verify: "校验", install: "安装" };
 const active = (state) => state?.status === "running" || state?.status === "stopping";
 const sizeLabel = (n) => n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(2)} GB` : formatBytes(n);
@@ -53,12 +53,21 @@ export function initModelDialog(refreshInventory) {
           missing.append(el("span", "", "缺少"), ...item.missing.map((file) => el("code", "", file)));
           row.append(missing);
         }
+        if (item.damaged?.length) {
+          const damaged = el("div", "model-install model-missing");
+          damaged.append(el("span", "", "文件异常"),
+            ...item.damaged.map((entry) => el("code", "", `${entry.file}：${entry.detail}`)));
+          row.append(damaged);
+        }
         if (item.issue) row.append(el("p", "model-issue", item.issue));
       }
       return row;
     }));
-    const missing = inventory.items.filter((item) => item.blocking).length;
-    status.textContent = missing ? `缺少 ${missing} 组必需模型` : "必需模型齐全";
+    const blocking = inventory.items.filter((item) => item.blocking);
+    const damaged = blocking.filter((item) => item.status === "damaged").length;
+    if (!blocking.length) status.textContent = "必需模型齐全";
+    else if (damaged) status.textContent = `${blocking.length} 组必需模型未就绪，其中 ${damaged} 组文件损坏`;
+    else status.textContent = `缺少 ${blocking.length} 组必需模型`;
   }
 
   const groupName = (group) => inventory?.items.find((item) => item.id === group)?.name ?? group;
