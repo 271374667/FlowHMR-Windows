@@ -1,5 +1,5 @@
 import { $, el, formatBytes, show } from "./utils.js";
-import { getModelDownload, startModelDownload, stopModelDownload } from "./api.js";
+import { getModelDownload, startModelDownload, stopModelDownload, verifyModels } from "./api.js";
 
 const LABELS = { ready: "已就绪", missing: "缺文件", damaged: "文件损坏", unavailable: "未就绪" };
 const PHASES = { download: "下载", verify: "校验", install: "安装" };
@@ -10,6 +10,7 @@ export function initModelDialog(refreshInventory) {
   const dialog = $("modelDialog"), list = $("modelList");
   const directory = $("modelDirectory"), folderButton = $("modelOpenFolder");
   const refreshButton = $("modelRefresh"), status = $("modelCheckStatus");
+  const verifyButton = $("modelVerify");
   const downloadButton = $("modelDownload"), stopButton = $("modelDownloadStop");
   const transferBox = $("modelTransfer"), transferLabel = $("modelTransferLabel");
   const transferBar = $("modelTransferBar"), transferErrors = $("modelTransferErrors");
@@ -146,6 +147,31 @@ export function initModelDialog(refreshInventory) {
     }
   }
 
+  async function verifyHashes() {
+    if (busy) return;
+    busy = true;
+    version++;
+    clearTimeout(pollTimer);
+    refreshButton.disabled = true;
+    verifyButton.disabled = true;
+    status.textContent = "正在校验文件哈希，首次可能需要几分钟…";
+    let message;
+    try {
+      const report = await verifyModels();
+      message = report.problems?.length
+        ? `哈希校验发现 ${report.problems.length} 个文件有问题`
+        : `哈希校验通过（${report.checked} 个文件）`;
+    } catch (error) {
+      message = `校验失败：${error.message}`;
+    }
+    busy = false;
+    refreshButton.disabled = false;
+    verifyButton.disabled = false;
+    // 重新读一次清单，让徽章反映刚写进缓存的哈希结果。
+    await refresh();
+    status.textContent = message;
+  }
+
   async function changeDownload(action) {
     if (busy) return;
     busy = true;
@@ -176,6 +202,7 @@ export function initModelDialog(refreshInventory) {
     void refresh();
   });
   refreshButton.addEventListener("click", refresh);
+  verifyButton.addEventListener("click", verifyHashes);
   downloadButton.addEventListener("click", () => changeDownload(startModelDownload));
   stopButton.addEventListener("click", () => changeDownload(() => stopModelDownload(transfer.id)));
   dialog.addEventListener("close", () => { version++; clearTimeout(pollTimer); });

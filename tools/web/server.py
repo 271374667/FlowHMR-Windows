@@ -46,6 +46,7 @@ from flowhmr.core.bodymodels.body_variants import available_variants, model_path
 from flowhmr.model_files import (
     SMPLH_FILES, core_model_paths, ensure_model_folders, file_present, flowhmr_paths, missing_model_paths, resolve_model,
 )
+from flowhmr import model_integrity
 from flowhmr.model_inventory import model_inventory
 from flowhmr.model_downloads import ACTIVE_DOWNLOAD, DownloadError, ModelDownloads, missing_downloads
 from flowhmr.runtime_environments import RUNTIME
@@ -1097,6 +1098,14 @@ def api_stop_model_download():
     if not isinstance(data, dict) or not isinstance(data.get("id"), str):
         return jsonify(error="无效的下载任务。"), 400
     return jsonify(MODEL_DOWNLOADS.stop(data["id"]))
+
+
+@app.route("/api/models/verify", methods=["POST"])
+def api_verify_models():
+    """Re-read every published model file and compare its SHA-256 with the source."""
+    if not local_model_request():
+        return jsonify(error="请在本机 FlowHMR 窗口校验模型。"), 403
+    return jsonify(model_integrity.summary(deep=True))
 
 
 @app.route("/api/upload", methods=["POST"])

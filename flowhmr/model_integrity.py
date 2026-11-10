@@ -34,6 +34,8 @@ _CACHE_PATH = files.PROJECT_ROOT / ".cache" / "model-integrity.json"
 _CACHE_VERSION = 1
 
 _lock = threading.Lock()
+# Verifying reads whole files; keep two dialogs from hashing the same 10 GB twice.
+_verify_lock = threading.Lock()
 _assets: dict[str, sources.Asset] | None = None
 _cache: dict[str, dict] | None = None
 _cache_stamp: tuple[int, int] | None = None
@@ -118,16 +120,17 @@ def digest(path) -> str:
 
 def verify(deep: bool = False) -> list[Verdict]:
     """Check every published file; with ``deep`` also compare SHA-256 digests."""
-    verdicts = []
-    for relative, asset in sorted(published_assets().items()):
-        path = files.resolve_model(relative)
-        verdict = check(path)
-        if verdict.ok and deep and asset.sha256:
-            if digest(path) != asset.sha256:
-                verdict = Verdict("corrupt", relative, verdict.size, asset.size,
-                                  "SHA-256 与发布值不一致")
-        verdicts.append(verdict)
-    return verdicts
+    with _verify_lock:
+        verdicts = []
+        for relative, asset in sorted(published_assets().items()):
+            path = files.resolve_model(relative)
+            verdict = check(path)
+            if verdict.ok and deep and asset.sha256:
+                if digest(path) != asset.sha256:
+                    verdict = Verdict("corrupt", relative, verdict.size, asset.size,
+                                      "SHA-256 与发布值不一致")
+            verdicts.append(verdict)
+        return verdicts
 
 
 def summary(deep: bool = False) -> dict:
